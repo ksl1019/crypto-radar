@@ -26,24 +26,28 @@ st.markdown("""
     .coin-card-neutral { border-left-color: #8B949E; }
     .badge-long {
         background-color: rgba(0, 208, 132, 0.15); color: #00D084;
-        padding: 3px 8px; border-radius: 6px; font-weight: bold; font-size: 0.8rem;
+        padding: 3px 8px; border-radius: 6px; font-weight: bold; font-size: 0.78rem;
+        display: inline-block;
     }
     .badge-short {
         background-color: rgba(255, 75, 75, 0.15); color: #FF4B4B;
-        padding: 3px 8px; border-radius: 6px; font-weight: bold; font-size: 0.8rem;
+        padding: 3px 8px; border-radius: 6px; font-weight: bold; font-size: 0.78rem;
+        display: inline-block;
     }
     .badge-neutral {
         background-color: rgba(139, 148, 158, 0.15); color: #C9D1D9;
-        padding: 3px 8px; border-radius: 6px; font-weight: bold; font-size: 0.8rem;
+        padding: 3px 8px; border-radius: 6px; font-weight: bold; font-size: 0.78rem;
+        display: inline-block;
     }
     .reason-box {
-        background-color: #0D1117; border-radius: 8px; padding: 10px;
-        margin-top: 8px; font-size: 0.85rem; line-height: 1.55; color: #C9D1D9;
+        background-color: #0D1117; border: 1px solid #21262D;
+        border-radius: 8px; padding: 10px 12px;
+        margin-top: 8px; font-size: 0.84rem; line-height: 1.55; color: #C9D1D9;
     }
     .lev-box {
         background-color: rgba(88, 166, 255, 0.1); border: 1px solid rgba(88, 166, 255, 0.3);
         border-radius: 8px; padding: 8px 10px; margin-top: 8px;
-        font-size: 0.84rem; color: #79C0FF;
+        font-size: 0.83rem; color: #79C0FF;
     }
     .news-card {
         background-color: #161B22; border: 1px solid #30363D;
@@ -58,15 +62,13 @@ KST = timezone(timedelta(hours=9))
 @st.cache_data(ttl=180)
 def get_market_overview():
     fng_val, fng_class, btc_dom = 50, "N/A", "N/A"
-    btc_price, btc_chg, btc_chg_num = "N/A", "", 0.0
+    btc_price_num, btc_chg_num = 0.0, 0.0
     funding_rate, funding_num = "N/A", 0.0
 
     try:
         res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr?symbol=BTCUSDT", timeout=5).json()
-        price_num = float(res["lastPrice"])
+        btc_price_num = float(res["lastPrice"])
         btc_chg_num = float(res["priceChangePercent"])
-        btc_price = f"${price_num:,.1f}"
-        btc_chg = f"({btc_chg_num:+.2f}%)"
     except Exception:
         pass
 
@@ -92,9 +94,60 @@ def get_market_overview():
 
     return {
         "fng_val": fng_val, "fng_class": fng_class, "btc_dom": btc_dom,
-        "btc_price": btc_price, "btc_chg": btc_chg, "btc_chg_num": btc_chg_num,
+        "btc_price_num": btc_price_num, "btc_chg_num": btc_chg_num,
         "funding_rate": funding_rate, "funding_num": funding_num
     }
+
+def render_realtime_top_board(ov):
+    init_price = f"${ov['btc_price_num']:,.1f}" if ov["btc_price_num"] > 0 else "연결 중..."
+    init_chg = f"{ov['btc_chg_num']:+.2f}%"
+    init_col = "#00D084" if ov["btc_chg_num"] >= 0 else "#FF4B4B"
+
+    html = f"""
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-family:sans-serif;">
+      <div style="background:#161B22; border:1px solid #30363D; border-radius:12px; padding:12px 14px;">
+        <div style="font-size:12px; color:#8B949E; display:flex; justify-content:space-between;">
+          <span>BTC 실시간 시세</span>
+          <span id="live-dot" style="color:#00D084; font-weight:bold;">● LIVE</span>
+        </div>
+        <div style="margin-top:4px;">
+          <span id="btc-live-price" style="font-size:18px; font-weight:bold; color:#F0F6FC;">{init_price}</span>
+          <span id="btc-live-chg" style="font-size:12px; font-weight:bold; color:{init_col}; margin-left:4px;">({init_chg})</span>
+        </div>
+        <div style="font-size:12px; color:#58A6FF; margin-top:4px;">펀딩비: {ov['funding_rate']}</div>
+      </div>
+
+      <div style="background:#161B22; border:1px solid #30363D; border-radius:12px; padding:12px 14px;">
+        <div style="font-size:12px; color:#8B949E;">공포·탐욕(일일) / 도미넌스</div>
+        <div style="font-size:18px; font-weight:bold; color:#F0F6FC; margin-top:4px;">
+          {ov['fng_val']} <span style="font-size:12px; font-weight:normal; color:#C9D1D9;">({ov['fng_class']})</span>
+        </div>
+        <div style="font-size:12px; color:#D2A8FF; margin-top:4px;">도미넌스: {ov['btc_dom']}</div>
+      </div>
+    </div>
+    <script>
+      const priceEl = document.getElementById('btc-live-price');
+      const chgEl = document.getElementById('btc-live-chg');
+      let lastPrice = {ov['btc_price_num']};
+      function connectWS() {{
+        const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker');
+        ws.onmessage = (event) => {{
+          const d = JSON.parse(event.data);
+          const p = parseFloat(d.c);
+          const chg = parseFloat(d.P);
+          priceEl.textContent = '$' + p.toLocaleString('en-US', {{minimumFractionDigits: 1, maximumFractionDigits: 1}});
+          priceEl.style.color = p >= lastPrice ? '#00D084' : '#FF4B4B';
+          setTimeout(() => {{ priceEl.style.color = '#F0F6FC'; }}, 350);
+          lastPrice = p;
+          chgEl.textContent = '(' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%)';
+          chgEl.style.color = chg >= 0 ? '#00D084' : '#FF4B4B';
+        }};
+        ws.onclose = () => setTimeout(connectWS, 3000);
+      }}
+      connectWS();
+    </script>
+    """
+    components.html(html, height=96)
 
 @st.cache_data(ttl=300)
 def get_us_indices():
@@ -113,7 +166,7 @@ def get_us_indices():
             indices[name] = {"price": "N/A", "chg": 0.0}
     return indices
 
-def fetch_klines(symbol, interval, limit=110):
+def fetch_klines(symbol, interval, limit=160):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     data = requests.get(url, timeout=5).json()
     df = pd.DataFrame(data, columns=[
@@ -151,20 +204,31 @@ def calc_indicators(df):
     return df
 
 @st.cache_data(ttl=300)
-def get_orderbook_walls(symbol="BTCUSDT"):
+def get_orderbook_heatmap(symbol="BTCUSDT"):
     url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=500"
     depth = requests.get(url, timeout=5).json()
     bids = pd.DataFrame(depth["bids"], columns=["price", "qty"]).astype(float)
     asks = pd.DataFrame(depth["asks"], columns=["price", "qty"]).astype(float)
     bids["notional"] = bids["price"] * bids["qty"]
     asks["notional"] = asks["price"] * asks["qty"]
-    top_bid = bids.groupby(np.round(bids["price"] / 250) * 250)["notional"].sum().idxmax()
-    top_ask = asks.groupby(np.round(asks["price"] / 250) * 250)["notional"].sum().idxmax()
-    return float(top_bid), float(top_ask)
 
-# ================= 2. 트레이딩뷰 모바일 캔들 차트 렌더러 =================
+    bids["bin"] = np.round(bids["price"] / 250) * 250
+    asks["bin"] = np.round(asks["price"] / 250) * 250
+    bid_grp = bids.groupby("bin")["notional"].sum().reset_index()
+    bid_grp["side"] = "BID"
+    ask_grp = asks.groupby("bin")["notional"].sum().reset_index()
+    ask_grp["side"] = "ASK"
+
+    combined = pd.concat([ask_grp.tail(6), bid_grp.tail(6)]).sort_values("bin", ascending=False)
+    top_bid_price = float(bid_grp.loc[bid_grp["notional"].idxmax(), "bin"])
+    top_bid_vol = float(bid_grp["notional"].max())
+    top_ask_price = float(ask_grp.loc[ask_grp["notional"].idxmax(), "bin"])
+    top_ask_vol = float(ask_grp["notional"].max())
+    return combined, top_bid_price, top_bid_vol, top_ask_price, top_ask_vol
+
+# ================= 2. 트레이딩뷰 모바일 캔들 & CVD 차트 렌더러 =================
 def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_waves=True, height=340):
-    sub = df.tail(75).copy().reset_index(drop=True)
+    sub = df.copy().reset_index(drop=True)
     candles = [
         {"time": int(r["ts"]), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])}
         for _, r in sub.iterrows()
@@ -174,8 +238,8 @@ def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_w
     ema99_data = [{"time": int(r["ts"]), "value": float(r["ema99"])} for _, r in sub.iterrows() if not np.isnan(r["ema99"])]
 
     markers = []
-    if show_waves and len(sub) >= 30:
-        step = 11
+    if show_waves and len(sub) >= 24:
+        step = max(6, len(sub) // 7)
         pivots = []
         for i in range(0, len(sub), step):
             chunk = sub.iloc[i:i+step]
@@ -234,6 +298,58 @@ def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_w
     """
     components.html(html_code, height=height + 6)
 
+def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
+    sub = df.tail(90).copy().reset_index(drop=True)
+    cvd_data = [{"time": int(r["ts"]), "value": float(r["cvd"])} for _, r in sub.iterrows()]
+    html_code = f"""
+    <div id="{chart_id}" style="width: 100%; height: {height}px; border-radius: 10px; overflow: hidden;"></div>
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+      const container = document.getElementById('{chart_id}');
+      const chart = LightweightCharts.createChart(container, {{
+        layout: {{ background: {{ color: '#0D1117' }}, textColor: '#C9D1D9' }},
+        grid: {{ vertLines: {{ color: '#1F242C' }}, horzLines: {{ color: '#1F242C' }} }},
+        rightPriceScale: {{ borderColor: '#30363D' }},
+        timeScale: {{ borderColor: '#30363D', timeVisible: true, secondsVisible: false }},
+        handleScroll: {{ mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false }},
+        handleScale: {{ axisPressedMouseMove: true, mouseWheel: true, pinch: true }}
+      }});
+      const areaSeries = chart.addAreaSeries({{
+        lineColor: '#00D084', topColor: 'rgba(0, 208, 132, 0.35)', bottomColor: 'rgba(0, 208, 132, 0.02)', lineWidth: 2
+      }});
+      areaSeries.setData({json.dumps(cvd_data)});
+      chart.timeScale().fitContent();
+    </script>
+    """
+    components.html(html_code, height=height + 6)
+
+def analyze_tf_wave(df, tf_name):
+    last = df.iloc[-1]
+    prev = df.iloc[-5] if len(df) >= 5 else df.iloc[0]
+    hi, lo = df["high"].max(), df["low"].min()
+    pos_pct = (last["close"] - lo) / (hi - lo + 1e-9) * 100
+    rsi_val = last["rsi"] if not np.isnan(last["rsi"]) else 50.0
+
+    if last["close"] > last["ema25"] and last["close"] > prev["close"]:
+        badge = '<span class="badge-long">🟢 롱 유리 (상승 파동 진행)</span>'
+        desc = (
+            f"<b>{tf_name} 기준:</b> 현재가가 주요 추세선(EMA 25) 상단에 안착해 있으며, 전체 고저점 대비 <b>{pos_pct:.0f}%</b> 위치에서 상승 파동을 이어가고 있습니다. "
+            f"RSI({rsi_val:.1f}) 과열 전까지는 눌림목 분할 매수가 유리합니다."
+        )
+    elif last["close"] < last["ema25"] and last["close"] < prev["close"]:
+        badge = '<span class="badge-short">🔴 숏 유리 (하락·조정 파동)</span>'
+        desc = (
+            f"<b>{tf_name} 기준:</b> 현재가가 주요 추세선(EMA 25) 아래에서 저항을 받고 있으며, 고저점 대비 <b>{pos_pct:.0f}%</b> 구간까지 밀린 조정 파동입니다. "
+            f"이평선 돌파 전까지는 반등 시 저항 숏 대응이 유리합니다."
+        )
+    else:
+        badge = '<span class="badge-neutral">⚪ 관망 (파동 방향 탐색)</span>'
+        desc = (
+            f"<b>{tf_name} 기준:</b> 추세선(EMA 25) 부근에서 매수·매도 힘이 맞서는 수렴(4파·B파 성격) 구간입니다. "
+            f"직전 고점 돌파나 지지선 이탈 확인 후 진입하는 것이 안전합니다."
+        )
+    return badge, desc
+
 # ================= 3. 무청산 안전 레버리지 & BTC 종합 스캔 =================
 def calc_safe_leverage(entry, sl, margin, beta=1.0, is_btc=False):
     sl_pct = abs(entry - sl) / entry * 100
@@ -255,7 +371,7 @@ def calc_safe_leverage(entry, sl, margin, beta=1.0, is_btc=False):
 
 @st.cache_data(ttl=480)
 def scan_all_markets(overview):
-    btc_4h = calc_indicators(fetch_klines("BTCUSDT", "4h", 110))
+    btc_4h = calc_indicators(fetch_klines("BTCUSDT", "4h", 140))
     c4h = btc_4h.iloc[-1]
     btc_price = float(c4h["close"])
     btc_atr = float(c4h["atr"])
@@ -495,32 +611,18 @@ def fetch_coinness_style_news():
 
 # ================= 5. 메인 화면 렌더링 =================
 st.markdown("### 📡 코인 선물 레이더")
-st.caption(f"업데이트: {datetime.now(KST).strftime('%Y-%m-%d %H:%M')} (KST)")
+st.caption(f"기준 시각: {datetime.now(KST).strftime('%Y-%m-%d %H:%M')} (KST) · 상단 BTC 시세 실시간 자동 갱신")
 
-if st.button("🔄 실시간 데이터 새로고침", use_container_width=True):
+ov = get_market_overview()
+render_realtime_top_board(ov)
+
+if st.button("🔄 전체 지표·추천·뉴스 새로고침", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-ov = get_market_overview()
-c1, c2 = st.columns(2)
-with c1:
-    chg_col = "#00D084" if ov["btc_chg_num"] >= 0 else "#FF4B4B"
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="font-size:0.78rem; color:#8B949E;">BTC 현재가 / 펀딩비</div>
-        <div style="font-size:1.05rem; font-weight:bold; color:#F0F6FC;">{ov['btc_price']} <span style="font-size:0.78rem; color:{chg_col};">{ov['btc_chg']}</span></div>
-        <div style="font-size:0.8rem; color:#58A6FF;">펀딩비: {ov['funding_rate']}</div>
-    </div>""", unsafe_allow_html=True)
-with c2:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="font-size:0.78rem; color:#8B949E;">공포·탐욕(일일) / 도미넌스</div>
-        <div style="font-size:1.05rem; font-weight:bold; color:#F0F6FC;">{ov['fng_val']} <span style="font-size:0.78rem;">({ov['fng_class']})</span></div>
-        <div style="font-size:0.8rem; color:#D2A8FF;">도미넌스: {ov['btc_dom']}</div>
-    </div>""", unsafe_allow_html=True)
-
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 시장 브리핑", "🎯 추천 종목", "📅 경제 일정", "📰 경제·속보", "📝 매매일지"])
 
+# ---------------- TAB 1: 시장 브리핑 (4분할 파동 + CVD + 파이어차트) ----------------
 with tab1:
     halving_date = datetime(2024, 4, 20, tzinfo=KST)
     days_passed = (datetime.now(KST) - halving_date).days
@@ -528,33 +630,113 @@ with tab1:
     st.markdown(f"""
     <div class="metric-card">
         <div style="font-weight:bold; color:#F0F6FC; margin-bottom:4px;">⏳ 비트코인 반감기 & 거시 싸이클</div>
-        <div style="font-size:0.88rem; color:#FFA657;">4차 반감기 후 <b>{days_passed}일 경과</b> (거시 조정 파동 구간)</div>
+        <div style="font-size:0.86rem; color:#FFA657;">4차 반감기 후 <b>{days_passed}일 경과</b></div>
         <div class="reason-box">
-            • 반감기 후 12~18개월 고점 형성 뒤 약 1년간 거시 조정 구간이 진행됩니다.<br>
-            • 무리한 고배율 추격보다 <b>유동성 매물벽 지지·저항 확인 후 분할 진입</b>이 유리합니다.
+            <span class="badge-neutral">⚪ 거시 싸이클 해석</span><br>
+            반감기 이후 12~18개월 사이 대형 고점을 형성한 뒤 약 1년간 거시 조정 파동이 진행됩니다. 무리한 고배율 추격보다 아래 <b>시간대별 파동·CVD·유동성 매물벽</b>을 함께 확인하고 분할 대응하세요.
         </div>
     </div>""", unsafe_allow_html=True)
     st.progress(progress)
 
-    st.markdown("#### 🕯️ BTC 4시간봉 & 호가 유동성 매물벽 (핀치 줌 지원)")
+    st.markdown("#### 🕯️ 비트코인 엘리어트 파동 분석 (두 손가락 확대·축소)")
+    tf_tabs = st.tabs(["월봉 (거시)", "주봉 (중장기)", "일봉 (스윙)", "4시간봉 (단기)"])
+    tf_configs = [
+        ("1M", 120, "월봉(1M) 거시 파동", "tv_btc_1m"),
+        ("1w", 160, "주봉(1W) 중장기 파동", "tv_btc_1w"),
+        ("1d", 160, "일봉(1D) 스윙 파동", "tv_btc_1d"),
+        ("4h", 160, "4시간봉(4H) 단기 파동", "tv_btc_4h")
+    ]
+    btc_4h_cached = None
+    for t_tab, (interval, lim, label, cid) in zip(tf_tabs, tf_configs):
+        with t_tab:
+            try:
+                df_tf = calc_indicators(fetch_klines("BTCUSDT", interval, lim))
+                if interval == "4h":
+                    btc_4h_cached = df_tf
+                render_tv_candle_chart(df_tf, cid, show_ema=True, show_waves=True, height=340)
+                badge_html, wave_desc = analyze_tf_wave(df_tf, label)
+                st.markdown(f"""
+                <div class="reason-box">
+                    {badge_html}<br>
+                    <div style="margin-top:5px;">{wave_desc}</div>
+                </div>""", unsafe_allow_html=True)
+            except Exception:
+                st.warning(f"{label} 데이터를 불러오는 중입니다.")
+
+    st.markdown("#### 📈 BTC 누적 거래량 델타 (CVD - 4시간봉 수급 추이)")
     try:
-        btc_df = calc_indicators(fetch_klines("BTCUSDT", "4h", 90))
-        top_bid, top_ask = get_orderbook_walls("BTCUSDT")
-        walls = [
-            {"price": top_ask, "color": "#FF4B4B", "width": 2, "style": 2, "title": "상단 청산·매도벽"},
-            {"price": top_bid, "color": "#00D084", "width": 2, "style": 2, "title": "하단 지지·매수벽"}
-        ]
-        render_tv_candle_chart(btc_df, "tv_btc_main", price_lines=walls, show_ema=True, show_waves=True, height=340)
-        cvd_trend = "매수세 유입 우세 (상방 지지)" if btc_df["cvd"].iloc[-1] > btc_df["cvd"].iloc[-6] else "매도세 출회 우세 (하방 압력)"
+        if btc_4h_cached is None:
+            btc_4h_cached = calc_indicators(fetch_klines("BTCUSDT", "4h", 120))
+        render_tv_cvd_chart(btc_4h_cached, "tv_btc_cvd", height=220)
+
+        price_up = btc_4h_cached["close"].iloc[-1] > btc_4h_cached["close"].iloc[-6]
+        cvd_up = btc_4h_cached["cvd"].iloc[-1] > btc_4h_cached["cvd"].iloc[-6]
+
+        if price_up and cvd_up:
+            cvd_badge = '<span class="badge-long">🟢 호재 (실매수 유입 동반 상승)</span>'
+            cvd_desc = "가격이 오르는 동안 실제 시장가 매수 체결(CVD)도 같이 늘어나고 있습니다. 세력·현물 매수세가 뒷받침되는 건강한 상승입니다."
+        elif (not price_up) and cvd_up:
+            cvd_badge = '<span class="badge-long">🟢 반등 신호 (저점 매도 물량 흡수)</span>'
+            cvd_desc = "가격은 눌렸지만 CVD는 오히려 버티거나 올라가고 있습니다. 누군가 시장가 매도 물량을 조용히 받아내고 있어 단기 반등 확률이 높습니다."
+        elif price_up and (not cvd_up):
+            cvd_badge = '<span class="badge-short">🔴 악재 경계 (수급 없는 가짜 반등 주의)</span>'
+            cvd_desc = "가격만 살짝 올랐을 뿐 실제 시장가 매수세는 빠져나가고 있습니다. 저항선 부근에서 다시 급락할 위험이 크니 롱 추격을 자제하세요."
+        else:
+            cvd_badge = '<span class="badge-short">🔴 악재 (매도 출회 우세 · 하방 압력)</span>'
+            cvd_desc = "가격 하락과 함께 시장가 매도 물량이 계속 쏟아지고 있습니다. 하락 멈춤(CVD 바닥 다지기) 확인 전까지는 롱 진입을 보류하세요."
+
         st.markdown(f"""
         <div class="reason-box">
-            • <b>상단 저항/청산 매물벽:</b> <span style="color:#FF7B72;">${top_ask:,.0f}</span> &nbsp;|&nbsp;
-              <b>하단 지지/매수 매물벽:</b> <span style="color:#7EE787;">${top_bid:,.0f}</span><br>
-            • <b>최근 24시간 CVD 수급:</b> {cvd_trend}
+            {cvd_badge}<br>
+            <div style="margin-top:5px;">{cvd_desc}</div>
         </div>""", unsafe_allow_html=True)
     except Exception:
-        st.warning("비트코인 차트 데이터를 불러오는 중입니다.")
+        st.warning("CVD 수급 차트를 불러오는 중입니다.")
 
+    st.markdown("#### 🔥 파이어차트 (실시간 호가창 유동성 매물벽 히트맵)")
+    try:
+        heatmap_df, top_bid_p, top_bid_v, top_ask_p, top_ask_v = get_orderbook_heatmap("BTCUSDT")
+        max_notional = heatmap_df["notional"].max() + 1e-9
+        rows_html = ""
+        for _, r in heatmap_df.iterrows():
+            pct = min(100, int((r["notional"] / max_notional) * 100))
+            is_ask = r["side"] == "ASK"
+            bar_col = "#FF4B4B" if is_ask else "#00D084"
+            side_lbl = "매도벽" if is_ask else "매수벽"
+            rows_html += f"""
+            <div style="display:flex; align-items:center; margin-bottom:4px; font-size:0.78rem;">
+              <div style="width:78px; color:#C9D1D9; font-weight:bold;">${r['bin']:,.0f}</div>
+              <div style="flex:1; background:#0D1117; border-radius:4px; height:14px; overflow:hidden; margin:0 8px;">
+                <div style="width:{pct}%; background:{bar_col}; height:100%;"></div>
+              </div>
+              <div style="width:88px; text-align:right; color:{bar_col};">{side_lbl} ${r['notional']/1e6:.1f}M</div>
+            </div>"""
+
+        st.markdown(f"""
+        <div class="metric-card" style="padding:12px;">
+            {rows_html}
+        </div>""", unsafe_allow_html=True)
+
+        ratio = top_bid_v / (top_ask_v + 1e-9)
+        if ratio >= 1.25:
+            fire_badge = '<span class="badge-long">🟢 하방 지지 우세 (매수 방어벽 두터움)</span>'
+            fire_desc = f"하단 <b>${top_bid_p:,.0f}</b> 부근의 매수 대기 물량이 상단 매도벽(<b>${top_ask_p:,.0f}</b>)보다 약 <b>{ratio:.1f}배</b> 두껍게 깔려 있습니다. 급락 시 강한 반등 지지가 기대됩니다."
+        elif ratio <= 0.8:
+            fire_badge = '<span class="badge-short">🔴 상방 저항 우세 (매도·청산벽 두터움)</span>'
+            fire_desc = f"상단 <b>${top_ask_p:,.0f}</b> 부근에 매도 물량이 하단 지지벽(<b>${top_bid_p:,.0f}</b>)보다 두껍게 쌓여 있습니다. 해당 가격대 도달 시 저항을 맞고 눌릴 가능성이 높습니다."
+        else:
+            fire_badge = '<span class="badge-neutral">⚪ 매수·매도벽 균형 (박스권 대치)</span>'
+            fire_desc = f"상단 저항벽(<b>${top_ask_p:,.0f}</b>)과 하단 지지벽(<b>${top_bid_p:,.0f}</b>)의 물량 규모가 비슷합니다. 두 매물벽 사이에서 가두리 횡보할 가능성이 높습니다."
+
+        st.markdown(f"""
+        <div class="reason-box">
+            {fire_badge}<br>
+            <div style="margin-top:5px;">{fire_desc}</div>
+        </div>""", unsafe_allow_html=True)
+    except Exception:
+        st.warning("호가창 유동성 히트맵을 불러오는 중입니다.")
+
+# ---------------- TAB 2: 추천 종목 ----------------
 with tab2:
     user_margin = st.number_input("💰 내 이번 진입 증거금 ($)", min_value=10.0, value=100.0, step=10.0)
     with st.spinner("비트코인 종합 분석 및 거래대금 100위 코인 스캔 중..."):
@@ -605,8 +787,9 @@ with tab2:
                 {"price": p["fib_618"], "color": "#FFA657", "width": 1, "style": 1, "title": "Fib 0.618"},
                 {"price": p["fib_382"], "color": "#D2A8FF", "width": 1, "style": 1, "title": "Fib 0.382"}
             ]
-            render_tv_candle_chart(p["df_4h"], f"tv_pick_{idx}", price_lines=chart_lines, show_ema=True, show_waves=True, height=340)
+            render_tv_candle_chart(p["df_4h"].tail(90), f"tv_pick_{idx}", price_lines=chart_lines, show_ema=True, show_waves=True, height=340)
 
+# ---------------- TAB 3: 한글 미국 경제 일정 ----------------
 with tab3:
     st.markdown("#### 📅 이번 주 미국 주요 경제지표 발표 (한국시간)")
     st.caption("중요 지표 발표 전후 30분은 위아래 꼬리(휩쏘) 주의 구간입니다.")
@@ -625,6 +808,7 @@ with tab3:
                 <div style="font-size:0.82rem; color:#79C0FF;">💡 {ev['desc']}</div>
             </div>""", unsafe_allow_html=True)
 
+# ---------------- TAB 4: 코인니스 스타일 경제·속보 ----------------
 with tab4:
     st.markdown("#### 🇺🇸 미국 증시 vs 비트코인 실시간 흐름")
     us_idx = get_us_indices()
@@ -658,6 +842,7 @@ with tab4:
                 </div>
             </div>""", unsafe_allow_html=True)
 
+# ---------------- TAB 5: 구글 시트 연동 매매일지 ----------------
 with tab5:
     st.markdown("#### 📝 매매일지 및 성과 분석")
     sheet_url = st.secrets.get("SHEET_URL", "")
