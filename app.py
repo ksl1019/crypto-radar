@@ -16,6 +16,13 @@ st.markdown("""
 <style>
     .block-container { padding: 1rem 0.8rem 3rem 0.8rem; max-width: 620px; }
     header, footer { visibility: hidden; }
+    [data-stale="true"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
+    [data-testid="stStatusWidget"] {
+        visibility: hidden !important;
+    }
     .metric-card {
         background-color: #161B22; border: 1px solid #30363D;
         border-radius: 12px; padding: 12px 14px; margin-bottom: 10px;
@@ -1053,9 +1060,9 @@ def live_recommendations_section():
             ]
             render_tv_candle_chart(p["df_4h"].tail(90), f"tv_pick_{idx}", price_lines=chart_lines, show_ema=True, show_waves=True, height=340)
 
-@st.fragment(run_every="30s")
+@st.fragment(run_every="60s")
 def live_econ_calendar_section():
-    st.markdown(f"#### 📅 이번 주 미국 주요 경제지표 실시간 발표 (30초 자동 감시 · {datetime.now(KST).strftime('%H:%M:%S')})")
+    st.markdown(f"#### 📅 이번 주 미국 주요 경제지표 실시간 발표 (1분 자동 감시 · {datetime.now(KST).strftime('%H:%M:%S')})")
     st.caption("발표 시간이 되면 실제치(Actual)와 예상치 비교 후 호재·악재 설명이 실시간으로 반영됩니다.")
     events = get_korean_econ_calendar()
     if not events:
@@ -1112,7 +1119,7 @@ def live_news_section():
                 </div>
             </div>""", unsafe_allow_html=True)
 
-@st.fragment(run_every="20s")
+@st.fragment(run_every="60s")
 def live_trade_journal_section():
     sheet_url = st.secrets.get("SHEET_URL", "")
     if not sheet_url:
@@ -1139,7 +1146,7 @@ def live_trade_journal_section():
                 avail_bal = float(pd.to_numeric(last_b["진입가"], errors="coerce") or 0)
                 used_margin = float(pd.to_numeric(last_b["종료가"], errors="coerce") or 0)
 
-            # 2) 현재 보유 포지션 스냅샷 추출 (과거 잘못 밀린 OPEN_SNAPSHOT 메모 행도 필터링)
+            # 2) 현재 보유 포지션 스냅샷 추출
             open_mask = tag_col.str.startswith("OPEN_SNAPSHOT|") | memo_col.str.startswith("OPEN_SNAPSHOT|")
             df_open = df_all[tag_col.str.startswith("OPEN_SNAPSHOT|")].copy()
             if not df_open.empty:
@@ -1231,7 +1238,7 @@ def live_trade_journal_section():
 
 # ================= 8. 메인 화면 렌더링 =================
 st.markdown("### 📡 코인 선물 레이더")
-st.caption("BTC 시세는 1초마다 실시간 반영되며, 차트·발표지표·보유포지션·속보도 자동 갱신됩니다.")
+st.caption("BTC 시세와 보유 포지션은 1초마다 실시간 반영되며, 화면 깜빡임 없이 자동 갱신됩니다.")
 
 live_top_header_section()
 
