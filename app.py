@@ -42,7 +42,7 @@ st.markdown("""
     .reason-box {
         background-color: #0D1117; border: 1px solid #21262D;
         border-radius: 8px; padding: 10px 12px;
-        margin-top: 8px; font-size: 0.84rem; line-height: 1.55; color: #C9D1D9;
+        margin-top: 8px; font-size: 0.84rem; line-height: 1.58; color: #C9D1D9;
     }
     .lev-box {
         background-color: rgba(88, 166, 255, 0.1); border: 1px solid rgba(88, 166, 255, 0.3);
@@ -58,8 +58,8 @@ st.markdown("""
 
 KST = timezone(timedelta(hours=9))
 
-# ================= 1. 시장 요약 & 외부 데이터 수집 =================
-@st.cache_data(ttl=180)
+# ================= 1. 시장 요약 & 외부 데이터 수집 (100% 현물 기준) =================
+@st.cache_data(ttl=55)
 def get_market_overview():
     fng_val, fng_class, btc_dom = 50, "N/A", "N/A"
     btc_price_num, btc_chg_num = 0.0, 0.0
@@ -107,14 +107,14 @@ def render_realtime_top_board(ov):
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-family:sans-serif;">
       <div style="background:#161B22; border:1px solid #30363D; border-radius:12px; padding:12px 14px;">
         <div style="font-size:12px; color:#8B949E; display:flex; justify-content:space-between;">
-          <span>BTC 실시간 시세</span>
-          <span id="live-dot" style="color:#00D084; font-weight:bold;">● LIVE</span>
+          <span>BTC 현물 실시간</span>
+          <span style="color:#00D084; font-weight:bold;">● LIVE</span>
         </div>
         <div style="margin-top:4px;">
           <span id="btc-live-price" style="font-size:18px; font-weight:bold; color:#F0F6FC;">{init_price}</span>
           <span id="btc-live-chg" style="font-size:12px; font-weight:bold; color:{init_col}; margin-left:4px;">({init_chg})</span>
         </div>
-        <div style="font-size:12px; color:#58A6FF; margin-top:4px;">펀딩비: {ov['funding_rate']}</div>
+        <div style="font-size:12px; color:#58A6FF; margin-top:4px;">선물 펀딩비: {ov['funding_rate']}</div>
       </div>
 
       <div style="background:#161B22; border:1px solid #30363D; border-radius:12px; padding:12px 14px;">
@@ -149,7 +149,7 @@ def render_realtime_top_board(ov):
     """
     components.html(html, height=96)
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=40)
 def get_us_indices():
     indices = {}
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -166,7 +166,8 @@ def get_us_indices():
             indices[name] = {"price": "N/A", "chg": 0.0}
     return indices
 
-def fetch_klines(symbol, interval, limit=160):
+@st.cache_data(ttl=25)
+def fetch_spot_klines(symbol, interval, limit=160):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     data = requests.get(url, timeout=5).json()
     df = pd.DataFrame(data, columns=[
@@ -179,6 +180,7 @@ def fetch_klines(symbol, interval, limit=160):
     return df
 
 def calc_indicators(df):
+    df = df.copy()
     df["ema7"] = df["close"].ewm(span=7, adjust=False).mean()
     df["ema25"] = df["close"].ewm(span=25, adjust=False).mean()
     df["ema99"] = df["close"].ewm(span=99, adjust=False).mean()
@@ -203,8 +205,8 @@ def calc_indicators(df):
     df["cvd"] = df["delta"].cumsum()
     return df
 
-@st.cache_data(ttl=300)
-def get_orderbook_heatmap(symbol="BTCUSDT"):
+@st.cache_data(ttl=25)
+def get_spot_orderbook_heatmap(symbol="BTCUSDT"):
     url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=500"
     depth = requests.get(url, timeout=5).json()
     bids = pd.DataFrame(depth["bids"], columns=["price", "qty"]).astype(float)
@@ -226,7 +228,87 @@ def get_orderbook_heatmap(symbol="BTCUSDT"):
     top_ask_vol = float(ask_grp["notional"].max())
     return combined, top_bid_price, top_bid_vol, top_ask_price, top_ask_vol
 
-# ================= 2. 트레이딩뷰 모바일 캔들 & CVD 차트 렌더러 =================
+# ================= 2. 현물 엘리어트 파동(꼬리 규칙) & 피보나치 확장 예측 =================
+def fmt_p(val):
+    return f"${val:,.4f}" if val < 10 else f"${val:,.1f}"
+
+def analyze_spot_wave_and_fib(df, tf_name):
+    sub = df.tail(120).copy().reset_index(drop=True)
+    last_close = float(sub["close"].iloc[-1])
+    last_low = float(sub["low"].iloc[-1])
+    rsi_val = float(sub["rsi"].iloc[-1]) if not np.isnan(sub["rsi"].iloc[-1]) else 50.0
+
+    # 구간을 4등분하여 주요 스윙 피벗(꼬리 고점/저점) 추출
+    n = len(sub)
+    q1, q2, q3 = sub.iloc[:n//4], sub.iloc[n//4:n//2], sub.iloc[n//2:3*n//4]
+    q4 = sub.iloc[3*n//4:]
+
+    w0_low = float(q1["low"].min())
+    w1_high = float(q2["high"].max())      # 1파 고점 꼬리 (4파 침범 금지 기준선)
+    w2_low = float(q2["low"].min())
+    w3_high = float(q3["high"].max())      # 3파(또는 주요 파동) 고점 꼬리
+    w4_low = float(q4["low"].min())        # 최근 눌림목 저점 꼬리
+
+    # 파동 길이 기반 피보나치 확장 목표가 계산
+    wave1_len = max(w1_high - w0_low, (w3_high - w2_low) * 0.618)
+    anchor_low = min(w4_low, last_low)
+    fib_ext_100 = anchor_low + wave1_len * 1.0
+    fib_ext_1618 = anchor_low + wave1_len * 1.618
+
+    # 하락 시나리오용 피보나치 하방 목표
+    drop_len = max(w3_high - w4_low, wave1_len * 0.618)
+    fib_down_100 = w3_high - drop_len * 1.0
+    fib_down_1618 = w3_high - drop_len * 1.618
+
+    # 피보나치 되돌림 지지선 (w0_low -> w3_high 기준)
+    swing_range = max(w3_high - w0_low, 1e-9)
+    fib_ret_382 = w3_high - swing_range * 0.382
+    fib_ret_618 = w3_high - swing_range * 0.618
+
+    up_100_pct = (fib_ext_100 - last_close) / last_close * 100
+    up_1618_pct = (fib_ext_1618 - last_close) / last_close * 100
+    dn_100_pct = (fib_down_100 - last_close) / last_close * 100
+
+    # 엘리어트 4파 1파 고점 꼬리 침범 여부 판정 (현물 기준)
+    wick_violated = w4_low <= w1_high
+
+    if not wick_violated and last_close > w1_high:
+        badge = '<span class="badge-long">🟢 메인: 4파 눌림목 유효 → 5파 상승 여력</span>'
+        main_scen = (
+            f"현물 차트 기준 최근 저점 꼬리(<b>{fmt_p(w4_low)}</b>)가 1파 고점 꼬리(<b>{fmt_p(w1_high)}</b>)를 침범하지 않고 지켜냈습니다. "
+            f"상승 파동 규칙이 유효하며, 1차 피보나치 확장 목표는 <b>{fmt_p(fib_ext_100)} ({up_100_pct:+.1f}%)</b>, "
+            f"강한 5파 연장 시 1.618 확장 목표는 <b>{fmt_p(fib_ext_1618)} ({up_1618_pct:+.1f}%)</b>입니다."
+        )
+        alt_scen = (
+            f"만약 현물 캔들 꼬리가 1파 고점 <b>{fmt_p(w1_high)}</b> 아래로 단 $1라도 내려가면 기존 4파 상승 카운팅은 즉시 <b>무효화</b>되며, "
+            f"상승 종료 후 대형 ABC 하락 파동(1차 하방 목표 <b>{fmt_p(fib_down_100)}</b>)으로 관점을 전환해야 합니다."
+        )
+    else:
+        badge = '<span class="badge-short">🔴 1파 고점 꼬리 침범 → ABC 조정·하락 전환</span>'
+        main_scen = (
+            f"현물 저점 꼬리(<b>{fmt_p(w4_low)}</b>)가 직전 1파 고점(<b>{fmt_p(w1_high)}</b>)을 침범해 일반 충격 상승 파동(1-2-3-4-5)은 무효화되었습니다. "
+            f"현재는 ABC 하락 조정 파동이 우세하며, 하방 피보나치 1.0 목표는 <b>{fmt_p(fib_down_100)} ({dn_100_pct:+.1f}%)</b> 구간입니다."
+        )
+        alt_scen = (
+            f"만약 <b>{fmt_p(fib_ret_618)}</b> 지지선을 강하게 방어하고 직전 고점 <b>{fmt_p(w3_high)}</b>을 돌파 안착한다면, "
+            f"예외적 쐐기형(다이아고날) 파동으로 재해석되어 <b>{fmt_p(fib_ext_100)} ({up_100_pct:+.1f}%)</b>까지 반등 시나리오가 다시 열립니다."
+        )
+
+    chart_lines = [
+        {"price": w1_high, "color": "#FF4B4B", "width": 2, "style": 2, "title": "⚠️ 파동무효화(1파고점)"},
+        {"price": fib_ext_100, "color": "#00D084", "width": 1, "style": 1, "title": "🎯 Fib 1.0 목표"},
+        {"price": fib_ext_1618, "color": "#58A6FF", "width": 1, "style": 1, "title": "🎯 Fib 1.618 확장"},
+        {"price": fib_ret_618, "color": "#FFA657", "width": 1, "style": 3, "title": "되돌림 0.618"}
+    ]
+
+    html_desc = (
+        f"{badge} <span style='font-size:0.76rem; color:#8B949E;'>· 현물(Spot) 기준 · RSI {rsi_val:.1f}</span>"
+        f"<div style='margin-top:6px;'><b style='color:#7EE787;'>[🟢 메인 시나리오 · 피보나치 예측]</b><br>{main_scen}</div>"
+        f"<div style='margin-top:6px;'><b style='color:#FF7B72;'>[🔴 대안 시나리오 · 무효화 기준]</b><br>{alt_scen}</div>"
+    )
+    return html_desc, chart_lines, w1_high, fib_ext_100, fib_ext_1618, fib_ret_618, fib_ret_382
+
+# ================= 3. 트레이딩뷰 모바일 캔들 & CVD 차트 렌더러 =================
 def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_waves=True, height=340):
     sub = df.copy().reset_index(drop=True)
     candles = [
@@ -310,7 +392,7 @@ def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_w
       const ro = new ResizeObserver(entries => {{
         for (let entry of entries) {{
           const w = entry.contentRect.width;
-          if (w > 0) {{
+          if (w > 10) {{
             chart.resize(w, {height});
             chart.timeScale().fitContent();
           }}
@@ -349,7 +431,7 @@ def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
       const ro = new ResizeObserver(entries => {{
         for (let entry of entries) {{
           const w = entry.contentRect.width;
-          if (w > 0) {{
+          if (w > 10) {{
             chart.resize(w, {height});
             chart.timeScale().fitContent();
           }}
@@ -360,34 +442,7 @@ def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
     """
     components.html(html_code, height=height + 6)
 
-def analyze_tf_wave(df, tf_name):
-    last = df.iloc[-1]
-    prev = df.iloc[-5] if len(df) >= 5 else df.iloc[0]
-    hi, lo = df["high"].max(), df["low"].min()
-    pos_pct = (last["close"] - lo) / (hi - lo + 1e-9) * 100
-    rsi_val = last["rsi"] if not np.isnan(last["rsi"]) else 50.0
-
-    if last["close"] > last["ema25"] and last["close"] > prev["close"]:
-        badge = '<span class="badge-long">🟢 롱 유리 (상승 파동 진행)</span>'
-        desc = (
-            f"<b>{tf_name} 기준:</b> 현재가가 주요 추세선(EMA 25) 상단에 안착해 있으며, 전체 고저점 대비 <b>{pos_pct:.0f}%</b> 위치에서 상승 파동을 이어가고 있습니다. "
-            f"RSI({rsi_val:.1f}) 과열 전까지는 눌림목 분할 매수가 유리합니다."
-        )
-    elif last["close"] < last["ema25"] and last["close"] < prev["close"]:
-        badge = '<span class="badge-short">🔴 숏 유리 (하락·조정 파동)</span>'
-        desc = (
-            f"<b>{tf_name} 기준:</b> 현재가가 주요 추세선(EMA 25) 아래에서 저항을 받고 있으며, 고저점 대비 <b>{pos_pct:.0f}%</b> 구간까지 밀린 조정 파동입니다. "
-            f"이평선 돌파 전까지는 반등 시 저항 숏 대응이 유리합니다."
-        )
-    else:
-        badge = '<span class="badge-neutral">⚪ 관망 (파동 방향 탐색)</span>'
-        desc = (
-            f"<b>{tf_name} 기준:</b> 추세선(EMA 25) 부근에서 매수·매도 힘이 맞서는 수렴(4파·B파 성격) 구간입니다. "
-            f"직전 고점 돌파나 지지선 이탈 확인 후 진입하는 것이 안전합니다."
-        )
-    return badge, desc
-
-# ================= 3. 무청산 안전 레버리지 & BTC 종합 스캔 =================
+# ================= 4. 무청산 안전 레버리지 & 현물 기준 종합 스캔 =================
 def calc_safe_leverage(entry, sl, margin, beta=1.0, is_btc=False):
     sl_pct = abs(entry - sl) / entry * 100
     if sl_pct <= 0.1:
@@ -406,17 +461,14 @@ def calc_safe_leverage(entry, sl, margin, beta=1.0, is_btc=False):
     rec_lev = int(max(1, min(cap, round(max_safe * scale))))
     return rec_lev, sl_pct
 
-@st.cache_data(ttl=480)
+@st.cache_data(ttl=55)
 def scan_all_markets(overview):
-    btc_4h = calc_indicators(fetch_klines("BTCUSDT", "4h", 140))
+    btc_4h = calc_indicators(fetch_spot_klines("BTCUSDT", "4h", 140))
     c4h = btc_4h.iloc[-1]
     btc_price = float(c4h["close"])
     btc_atr = float(c4h["atr"])
 
-    recent_btc = btc_4h.tail(60)
-    hi_b, lo_b = float(recent_btc["high"].max()), float(recent_btc["low"].min())
-    fib_618_b = hi_b - (hi_b - lo_b) * 0.618
-    fib_382_b = hi_b - (hi_b - lo_b) * 0.382
+    _, _, w1_inv_b, fib100_b, fib1618_b, fib_618_b, fib_382_b = analyze_spot_wave_and_fib(btc_4h, "4시간봉")
 
     long_score, short_score = 0, 0
     btc_reasons = []
@@ -434,52 +486,47 @@ def scan_all_markets(overview):
 
     if fund < 0:
         long_score += 1
-        btc_reasons.append(f"• <b>펀딩비({overview['funding_rate']}):</b> 음수(-) 펀딩비로 숏 포지션 쏠림(숏 스퀴즈 여력)이 포착됩니다.")
+        btc_reasons.append(f"• <b>펀딩비({overview['funding_rate']}):</b> 음수(-) 펀딩비로 숏 스퀴즈 여력이 포착됩니다.")
     elif fund > 0.03:
         short_score += 1
         btc_reasons.append(f"• <b>펀딩비({overview['funding_rate']}):</b> 양수(+) 과열로 롱 포지션 유지 비용 부담이 큽니다.")
 
     if cvd_up:
         long_score += 1
-        btc_reasons.append("• <b>CVD 수급:</b> 최근 24시간 시장가 매수 델타가 우세합니다.")
+        btc_reasons.append("• <b>현물 CVD 수급:</b> 최근 24시간 시장가 매수 델타가 우세합니다.")
     else:
         short_score += 1
-        btc_reasons.append("• <b>CVD 수급:</b> 최근 24시간 시장가 매도 출회 압력이 우세합니다.")
+        btc_reasons.append("• <b>현물 CVD 수급:</b> 최근 24시간 시장가 매도 출회 압력이 우세합니다.")
 
     if c4h["close"] > c4h["ema25"]:
         long_score += 1.5
-        btc_reasons.append("• <b>4시간봉 이평선 & 파동:</b> EMA 25 상단 지지를 받으며 단기 상승 파동을 이어가고 있습니다.")
+        btc_reasons.append("• <b>현물 4시간봉 추세:</b> EMA 25 상단 지지를 받으며 상승 파동을 이어가고 있습니다.")
     else:
         short_score += 1.5
-        btc_reasons.append("• <b>4시간봉 이평선 & 파동:</b> EMA 25 저항 아래에서 조정 파동(하방 압력)이 진행 중입니다.")
-
-    if c4h["rsi"] < 35:
-        long_score += 1.5
-        btc_reasons.append(f"• <b>RSI({c4h['rsi']:.1f}):</b> 과매도권 진입으로 분할 반등 타점이 유효합니다.")
-    elif c4h["rsi"] > 68:
-        short_score += 1.5
-        btc_reasons.append(f"• <b>RSI({c4h['rsi']:.1f}):</b> 과매수권 근접으로 단기 저항 눌림 가능성이 높습니다.")
+        btc_reasons.append("• <b>현물 4시간봉 추세:</b> EMA 25 저항 아래에서 조정 파동이 진행 중입니다.")
 
     if abs(long_score - short_score) < 1.0:
         btc_dir = "SIDEWAYS"
         btc_sl = btc_price - (1.2 * btc_atr)
-        btc_tp = btc_price + (1.2 * btc_atr)
-        btc_reasons.append("• <b>종합 판단:</b> 상·하방 힘이 팽팽한 박스권 횡보 구간입니다. 돌파 확인 전까지 관망을 권장합니다.")
+        btc_tp = fib100_b if fib100_b > btc_price else btc_price + (1.5 * btc_atr)
+        btc_reasons.append(f"• <b>대안 시나리오:</b> 1파 고점 꼬리(<b>${w1_inv_b:,.1f}</b>) 이탈 여부에 따라 방향성이 확정됩니다.")
     elif long_score > short_score:
         btc_dir = "LONG"
-        btc_sl = btc_price - (1.5 * btc_atr)
-        btc_tp = btc_price + (2.5 * btc_atr)
+        btc_sl = max(w1_inv_b * 0.997, btc_price - (1.5 * btc_atr)) if w1_inv_b < btc_price else btc_price - (1.5 * btc_atr)
+        btc_tp = fib100_b if fib100_b > btc_price else btc_price + (2.5 * btc_atr)
+        btc_reasons.append(f"• <b>피보나치 목표 & 무효화:</b> 1차 확장 <b>${fib100_b:,.1f}</b> (1.618: <b>${fib1618_b:,.1f}</b>) / 무효화 선 <b>${w1_inv_b:,.1f}</b>")
     else:
         btc_dir = "SHORT"
         btc_sl = btc_price + (1.5 * btc_atr)
         btc_tp = btc_price - (2.5 * btc_atr)
+        btc_reasons.append(f"• <b>하방 타점 근거:</b> 1파 고점 꼬리(<b>${w1_inv_b:,.1f}</b>) 아래에서 조정 파동이 이어지고 있습니다.")
 
     btc_pick = {
         "symbol": "BTCUSDT (기준 대장주)", "raw_symbol": "BTCUSDT", "is_btc": True,
         "direction": btc_dir, "price": btc_price, "sl": btc_sl, "tp": btc_tp,
         "reasons": "<br>".join(btc_reasons), "df_4h": btc_4h,
-        "fib_618": fib_618_b, "fib_382": fib_382_b, "rsi": float(c4h["rsi"]),
-        "corr": 1.0, "beta": 1.0
+        "fib_618": fib_618_b, "fib_382": fib_382_b, "fib_100": fib100_b, "fib_1618": fib1618_b, "w1_inv": w1_inv_b,
+        "rsi": float(c4h["rsi"]), "corr": 1.0, "beta": 1.0
     }
 
     tickers = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=5).json()
@@ -498,10 +545,12 @@ def scan_all_markets(overview):
     for item in candidates:
         sym = item["symbol"]
         try:
-            df_1d = calc_indicators(fetch_klines(sym, "1d", 110))
-            df_4h = calc_indicators(fetch_klines(sym, "4h", 110))
+            df_1d = calc_indicators(fetch_spot_klines(sym, "1d", 110))
+            df_4h = calc_indicators(fetch_spot_klines(sym, "4h", 110))
             a1d, a4h, pa4h = df_1d.iloc[-1], df_4h.iloc[-1], df_4h.iloc[-2]
             price, atr = float(a4h["close"]), float(a4h["atr"])
+
+            _, _, w1_inv, fib100, fib1618, fib_618, fib_382 = analyze_spot_wave_and_fib(df_4h, "4시간봉")
 
             alt_ret = df_4h["close"].pct_change().tail(60)
             corr = float(btc_ret.corr(alt_ret))
@@ -509,33 +558,31 @@ def scan_all_markets(overview):
                 corr = 0.5
             beta = float(alt_ret.std() / (btc_ret.std() + 1e-9))
 
-            recent = df_4h.tail(60)
-            hi, lo = float(recent["high"].max()), float(recent["low"].min())
-            fib_618 = hi - (hi - lo) * 0.618
-            fib_382 = hi - (hi - lo) * 0.382
-
             reasons, direction, score = [], None, 0
 
             if a1d["close"] > a1d["ema25"] and a4h["ema7"] > a4h["ema25"] and 42 <= a4h["rsi"] <= 68:
                 score += 3
-                reasons.append(f"• <b>추세 & 이평선 정배열:</b> 일봉·4시간봉 EMA 정배열 및 RSI({a4h['rsi']:.1f}) 건강한 상승 흐름입니다.")
-                if abs(price - fib_618) / price < 0.035 or price > fib_382:
+                reasons.append(f"• <b>현물 추세 정배열:</b> 일봉·4시간봉 EMA 정배열 및 RSI({a4h['rsi']:.1f}) 건강한 상승 흐름입니다.")
+                if fib100 > price:
+                    up_pct = (fib100 - price) / price * 100
+                    reasons.append(f"• <b>피보나치 확장 예측:</b> 1차 목표 <b>${fib100:,.4f} (+{up_pct:.1f}%)</b> / 1.618 확장 <b>${fib1618:,.4f}</b>")
+                if abs(price - fib_618) / price < 0.04 or price > fib_382:
                     score += 1
-                    reasons.append(f"• <b>피보나치 지지:</b> 되돌림 주요 구간(${fib_618:,.4f}~${fib_382:,.4f}) 상단에서 지지받고 있습니다.")
+                    reasons.append(f"• <b>피보나치 지지 & 파동:</b> 되돌림 지지(${fib_618:,.4f}) 상단 유지 (무효화 선: ${w1_inv:,.4f}).")
                 if a4h["hist"] > 0 and a4h["hist"] > pa4h["hist"]:
                     score += 1
-                    reasons.append("• <b>MACD 수급 확장:</b> 매수 모멘텀 히스토그램이 강해지고 있습니다.")
+                    reasons.append("• <b>MACD 매수 수급:</b> 히스토그램 상승 모멘텀이 강해지고 있습니다.")
                 if corr >= 0.70 and btc_dir == "SHORT":
                     score -= 2
                 elif corr < 0.35:
                     score += 1
-                    reasons.append(f"• <b>독자 행보(디커플링 {corr*100:.0f}%):</b> 비트코인 눈치를 보지 않고 자체 수급으로 움직이는 종목입니다.")
+                    reasons.append(f"• <b>독자 행보(디커플링 {corr*100:.0f}%):</b> 비트코인 영향 없이 자체 수급으로 상승 중입니다.")
                 if score >= 4:
                     direction = "LONG"
 
             elif a1d["close"] < a1d["ema25"] and a4h["ema7"] < a4h["ema25"] and 32 <= a4h["rsi"] <= 58:
                 score += 3
-                reasons.append(f"• <b>하락 추세 & 역배열:</b> 일봉·4시간봉 EMA 저항 아래에서 RSI({a4h['rsi']:.1f}) 추가 하락 여력이 있습니다.")
+                reasons.append(f"• <b>현물 하락 역배열:</b> 일봉·4시간봉 EMA 저항 아래에서 RSI({a4h['rsi']:.1f}) 추가 하락 여력이 있습니다.")
                 if a4h["hist"] < 0 and a4h["hist"] < pa4h["hist"]:
                     score += 1
                     reasons.append("• <b>MACD 매도 압력:</b> 반등 실패 후 음봉 모멘텀이 다시 확대되고 있습니다.")
@@ -548,14 +595,19 @@ def scan_all_markets(overview):
                     direction = "SHORT"
 
             if direction:
-                sl = price - (1.5 * atr) if direction == "LONG" else price + (1.5 * atr)
-                tp = price + (2.5 * atr) if direction == "LONG" else price - (2.5 * atr)
+                if direction == "LONG":
+                    sl = max(w1_inv * 0.996, price - (1.5 * atr)) if w1_inv < price else price - (1.5 * atr)
+                    tp = fib100 if fib100 > price * 1.015 else price + (2.5 * atr)
+                else:
+                    sl = price + (1.5 * atr)
+                    tp = price - (2.5 * atr)
+
                 alt_picks.append({
                     "symbol": sym, "raw_symbol": sym, "is_btc": False,
                     "direction": direction, "price": price, "sl": sl, "tp": tp,
                     "score": score, "reasons": "<br>".join(reasons), "df_4h": df_4h,
-                    "fib_618": fib_618, "fib_382": fib_382, "rsi": float(a4h["rsi"]),
-                    "corr": corr, "beta": beta
+                    "fib_618": fib_618, "fib_382": fib_382, "fib_100": fib100, "fib_1618": fib1618, "w1_inv": w1_inv,
+                    "rsi": float(a4h["rsi"]), "corr": corr, "beta": beta
                 })
         except Exception:
             continue
@@ -563,8 +615,8 @@ def scan_all_markets(overview):
     top_alts = sorted(alt_picks, key=lambda x: x["score"], reverse=True)[:5]
     return btc_pick, top_alts
 
-# ================= 4. 한글 경제 일정 & 코인니스 스타일 속보 =================
-@st.cache_data(ttl=1800)
+# ================= 5. 한글 경제 일정 & 코인니스 스타일 속보 =================
+@st.cache_data(ttl=300)
 def get_korean_econ_calendar():
     trans_map = {
         "CPI": ("소비자물가지수 (CPI)", "예상치 상회 시 연준 금리 인하 지연 우려로 코인 단기 하락 압력"),
@@ -616,7 +668,7 @@ def analyze_news_sentiment(title):
         return "🔴 악재 (하락 요인)", "badge-short", "위험자산 회피 심리 또는 매도 압력을 키울 수 있는 경계 재료입니다."
     return "⚪ 중립 (시장 관망)", "badge-neutral", "방향성 확정 전 추가 데이터와 시장 반응을 확인할 필요가 있습니다."
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=40)
 def fetch_coinness_style_news():
     feeds = [
         ("🇺🇸 미국 거시·증시", "https://news.google.com/rss/search?q=미국+증시+연준+금리+when:2d&hl=ko&gl=KR&ceid=KR:ko"),
@@ -646,93 +698,42 @@ def fetch_coinness_style_news():
             continue
     return items
 
-# ================= 5. 메인 화면 렌더링 =================
-st.markdown("### 📡 코인 선물 레이더")
-st.caption(f"기준 시각: {datetime.now(KST).strftime('%Y-%m-%d %H:%M')} (KST) · 상단 BTC 시세 실시간 자동 갱신")
+# ================= 6. 실시간 자동 갱신 섹션(@st.fragment) =================
+@st.fragment(run_every="60s")
+def live_top_header_section():
+    ov = get_market_overview()
+    render_realtime_top_board(ov)
 
-ov = get_market_overview()
-render_realtime_top_board(ov)
-
-if st.button("🔄 전체 지표·추천·뉴스 새로고침", use_container_width=True):
-    st.cache_data.clear()
-    st.rerun()
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 시장 브리핑", "🎯 추천 종목", "📅 경제 일정", "📰 경제·속보", "📝 매매일지"])
-
-# ---------------- TAB 1: 시장 브리핑 (4분할 파동 + CVD + 파이어차트) ----------------
-with tab1:
-    halving_date = datetime(2024, 4, 20, tzinfo=KST)
-    days_passed = (datetime.now(KST) - halving_date).days
-    progress = min(days_passed / 1460, 1.0)
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="font-weight:bold; color:#F0F6FC; margin-bottom:4px;">⏳ 비트코인 반감기 & 거시 싸이클</div>
-        <div style="font-size:0.86rem; color:#FFA657;">4차 반감기 후 <b>{days_passed}일 경과</b></div>
-        <div class="reason-box">
-            <span class="badge-neutral">⚪ 거시 싸이클 해석</span><br>
-            반감기 이후 12~18개월 사이 대형 고점을 형성한 뒤 약 1년간 거시 조정 파동이 진행됩니다. 무리한 고배율 추격보다 아래 <b>시간대별 파동·CVD·유동성 매물벽</b>을 함께 확인하고 분할 대응하세요.
-        </div>
-    </div>""", unsafe_allow_html=True)
-    st.progress(progress)
-
-    st.markdown("#### 🕯️ 비트코인 엘리어트 파동 분석 (두 손가락 확대·축소)")
-    tf_tabs = st.tabs(["월봉 (거시)", "주봉 (중장기)", "일봉 (스윙)", "4시간봉 (단기)"])
-    tf_configs = [
-        ("1M", 120, "월봉(1M) 거시 파동", "tv_btc_1m"),
-        ("1w", 160, "주봉(1W) 중장기 파동", "tv_btc_1w"),
-        ("1d", 160, "일봉(1D) 스윙 파동", "tv_btc_1d"),
-        ("4h", 160, "4시간봉(4H) 단기 파동", "tv_btc_4h")
-    ]
-    btc_4h_cached = None
-    for t_tab, (interval, lim, label, cid) in zip(tf_tabs, tf_configs):
-        with t_tab:
-            try:
-                df_tf = calc_indicators(fetch_klines("BTCUSDT", interval, lim))
-                if interval == "4h":
-                    btc_4h_cached = df_tf
-                render_tv_candle_chart(df_tf, cid, show_ema=True, show_waves=True, height=340)
-                badge_html, wave_desc = analyze_tf_wave(df_tf, label)
-                st.markdown(f"""
-                <div class="reason-box">
-                    {badge_html}<br>
-                    <div style="margin-top:5px;">{wave_desc}</div>
-                </div>""", unsafe_allow_html=True)
-            except Exception:
-                st.warning(f"{label} 데이터를 불러오는 중입니다.")
-
-    st.markdown("#### 📈 BTC 누적 거래량 델타 (CVD - 4시간봉 수급 추이)")
+@st.fragment(run_every="30s")
+def live_cvd_and_firechart_section():
+    st.markdown("#### 📈 BTC 현물 누적 거래량 델타 (CVD · 30초 자동 갱신)")
     try:
-        if btc_4h_cached is None:
-            btc_4h_cached = calc_indicators(fetch_klines("BTCUSDT", "4h", 120))
-        render_tv_cvd_chart(btc_4h_cached, "tv_btc_cvd", height=220)
+        btc_4h_df = calc_indicators(fetch_spot_klines("BTCUSDT", "4h", 120))
+        render_tv_cvd_chart(btc_4h_df, "tv_btc_cvd", height=220)
 
-        price_up = btc_4h_cached["close"].iloc[-1] > btc_4h_cached["close"].iloc[-6]
-        cvd_up = btc_4h_cached["cvd"].iloc[-1] > btc_4h_cached["cvd"].iloc[-6]
+        price_up = btc_4h_df["close"].iloc[-1] > btc_4h_df["close"].iloc[-6]
+        cvd_up = btc_4h_df["cvd"].iloc[-1] > btc_4h_df["cvd"].iloc[-6]
 
         if price_up and cvd_up:
             cvd_badge = '<span class="badge-long">🟢 호재 (실매수 유입 동반 상승)</span>'
-            cvd_desc = "가격이 오르는 동안 실제 시장가 매수 체결(CVD)도 같이 늘어나고 있습니다. 세력·현물 매수세가 뒷받침되는 건강한 상승입니다."
+            cvd_desc = "현물 가격이 오르는 동안 실제 시장가 매수 체결(CVD)도 같이 늘어나고 있습니다. 현물 매수세가 뒷받침되는 건강한 상승입니다."
         elif (not price_up) and cvd_up:
             cvd_badge = '<span class="badge-long">🟢 반등 신호 (저점 매도 물량 흡수)</span>'
-            cvd_desc = "가격은 눌렸지만 CVD는 오히려 버티거나 올라가고 있습니다. 누군가 시장가 매도 물량을 조용히 받아내고 있어 단기 반등 확률이 높습니다."
+            cvd_desc = "가격은 눌렸지만 CVD는 오히려 버티거나 올라가고 있습니다. 현물 시장에서 매도 물량을 받아내고 있어 단기 반등 확률이 높습니다."
         elif price_up and (not cvd_up):
             cvd_badge = '<span class="badge-short">🔴 악재 경계 (수급 없는 가짜 반등 주의)</span>'
-            cvd_desc = "가격만 살짝 올랐을 뿐 실제 시장가 매수세는 빠져나가고 있습니다. 저항선 부근에서 다시 급락할 위험이 크니 롱 추격을 자제하세요."
+            cvd_desc = "가격만 살짝 올랐을 뿐 실제 시장가 매수세는 빠져나가고 있습니다. 저항선 부근에서 다시 밀릴 위험이 크니 롱 추격을 자제하세요."
         else:
             cvd_badge = '<span class="badge-short">🔴 악재 (매도 출회 우세 · 하방 압력)</span>'
-            cvd_desc = "가격 하락과 함께 시장가 매도 물량이 계속 쏟아지고 있습니다. 하락 멈춤(CVD 바닥 다지기) 확인 전까지는 롱 진입을 보류하세요."
+            cvd_desc = "가격 하락과 함께 시장가 매도 물량이 계속 쏟아지고 있습니다. CVD 바닥 다지기 확인 전까지는 롱 진입을 보류하세요."
 
-        st.markdown(f"""
-        <div class="reason-box">
-            {cvd_badge}<br>
-            <div style="margin-top:5px;">{cvd_desc}</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f'<div class="reason-box">{cvd_badge}<div style="margin-top:5px;">{cvd_desc}</div></div>', unsafe_allow_html=True)
     except Exception:
         st.warning("CVD 수급 차트를 불러오는 중입니다.")
 
-    st.markdown("#### 🔥 파이어차트 (실시간 호가창 유동성 매물벽 히트맵)")
+    st.markdown("#### 🔥 현물 파이어차트 (실시간 호가창 유동성 매물벽)")
     try:
-        heatmap_df, top_bid_p, top_bid_v, top_ask_p, top_ask_v = get_orderbook_heatmap("BTCUSDT")
+        heatmap_df, top_bid_p, top_bid_v, top_ask_p, top_ask_v = get_spot_orderbook_heatmap("BTCUSDT")
         max_notional = heatmap_df["notional"].max() + 1e-9
         rows_html = ""
         for _, r in heatmap_df.iterrows():
@@ -747,26 +748,25 @@ with tab1:
         ratio = top_bid_v / (top_ask_v + 1e-9)
         if ratio >= 1.25:
             fire_badge = '<span class="badge-long">🟢 하방 지지 우세 (매수 방어벽 두터움)</span>'
-            fire_desc = f"하단 <b>${top_bid_p:,.0f}</b> 부근의 매수 대기 물량이 상단 매도벽(<b>${top_ask_p:,.0f}</b>)보다 약 <b>{ratio:.1f}배</b> 두껍게 깔려 있습니다. 급락 시 강한 반등 지지가 기대됩니다."
+            fire_desc = f"하단 <b>${top_bid_p:,.0f}</b> 부근의 현물 매수 대기 물량이 상단 매도벽(<b>${top_ask_p:,.0f}</b>)보다 약 <b>{ratio:.1f}배</b> 두껍게 깔려 있습니다."
         elif ratio <= 0.8:
-            fire_badge = '<span class="badge-short">🔴 상방 저항 우세 (매도·청산벽 두터움)</span>'
-            fire_desc = f"상단 <b>${top_ask_p:,.0f}</b> 부근에 매도 물량이 하단 지지벽(<b>${top_bid_p:,.0f}</b>)보다 두껍게 쌓여 있습니다. 해당 가격대 도달 시 저항을 맞고 눌릴 가능성이 높습니다."
+            fire_badge = '<span class="badge-short">🔴 상방 저항 우세 (매도 저항벽 두터움)</span>'
+            fire_desc = f"상단 <b>${top_ask_p:,.0f}</b> 부근에 매도 물량이 하단 지지벽(<b>${top_bid_p:,.0f}</b>)보다 두껍게 쌓여 있습니다. 도달 시 저항 압력이 큽니다."
         else:
             fire_badge = '<span class="badge-neutral">⚪ 매수·매도벽 균형 (박스권 대치)</span>'
-            fire_desc = f"상단 저항벽(<b>${top_ask_p:,.0f}</b>)과 하단 지지벽(<b>${top_bid_p:,.0f}</b>)의 물량 규모가 비슷합니다. 두 매물벽 사이에서 가두리 횡보할 가능성이 높습니다."
+            fire_desc = f"상단 저항벽(<b>${top_ask_p:,.0f}</b>)과 하단 지지벽(<b>${top_bid_p:,.0f}</b>) 규모가 비슷해 두 매물벽 사이에서 횡보할 가능성이 높습니다."
 
-        st.markdown(f"""
-        <div class="reason-box">
-            {fire_badge}<br>
-            <div style="margin-top:5px;">{fire_desc}</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f'<div class="reason-box">{fire_badge}<div style="margin-top:5px;">{fire_desc}</div></div>', unsafe_allow_html=True)
     except Exception:
         st.warning("호가창 유동성 히트맵을 불러오는 중입니다.")
 
-# ---------------- TAB 2: 추천 종목 ----------------
-with tab2:
+@st.fragment(run_every="60s")
+def live_recommendations_section():
+    ov = get_market_overview()
     user_margin = st.number_input("💰 내 이번 진입 증거금 ($)", min_value=10.0, value=100.0, step=10.0)
-    with st.spinner("비트코인 종합 분석 및 거래대금 100위 코인 스캔 중..."):
+    st.caption(f"⚡ 현물 차트 기준 자동 스캔 중 · 최근 갱신: {datetime.now(KST).strftime('%H:%M:%S')} (1분마다 자동 반영)")
+
+    with st.spinner("현물 차트 기반 비트코인 및 거래대금 100위 코인 분석 중..."):
         btc_pick, alt_picks = scan_all_markets(ov)
 
     all_picks = [btc_pick] + alt_picks
@@ -790,53 +790,35 @@ with tab2:
                 <span style="font-size:1.08rem; font-weight:bold; color:#FFFFFF;">{p['symbol']}</span>
                 <span class="{badge_cls}">{label_txt}</span>
             </div>
-            <div style="font-size:0.78rem; color:#8B949E; margin-top:3px;">🔗 {corr_txt} · RSI(4H): {p['rsi']:.1f}</div>
+            <div style="font-size:0.78rem; color:#8B949E; margin-top:3px;">🔗 {corr_txt} · 현물 RSI(4H): {p['rsi']:.1f}</div>
             <div style="margin-top:8px; font-size:0.85rem; color:#8B949E;">
                 진입가: <b style="color:#F0F6FC;">${p['price']:,.4f}</b> &nbsp;|&nbsp;
                 손절가: <b style="color:#FF7B72;">${p['sl']:,.4f}</b> &nbsp;|&nbsp;
                 목표가: <b style="color:#7EE787;">${p['tp']:,.4f}</b>
             </div>
+            <div style="font-size:0.74rem; color:#8B949E; margin-top:2px;">※ 현물(Spot) 차트 기준 타점 · 선물 진입 시 호가 괴리만 확인</div>
             <div class="lev-box">
                 🛡️ <b>증거금 ${user_margin:,.0f} 기준 무청산 추천 배율: {rec_lev}배</b>
                 (예상 청산가: <b>${liq_price:,.4f}</b> · 손절폭 -{sl_pct:.1f}% 방어)
             </div>
             <div class="reason-box">
-                <div style="font-weight:bold; color:#58A6FF; margin-bottom:4px;">💡 추천 근거 분석</div>
+                <div style="font-weight:bold; color:#58A6FF; margin-bottom:4px;">💡 현물 파동 & 피보나치 추천 근거</div>
                 {p['reasons']}
             </div>
         </div>""", unsafe_allow_html=True)
 
-        with st.expander(f"🕯️ {p['raw_symbol']} 캔들 차트 작도 보기 (두 손가락 확대·축소)"):
+        with st.expander(f"🕯️ {p['raw_symbol']} 현물 캔들 차트 작도 보기 (두 손가락 확대·축소)"):
             chart_lines = [
                 {"price": p["price"], "color": "#FFFFFF", "width": 1, "style": 0, "title": "진입가"},
                 {"price": p["sl"], "color": "#FF4B4B", "width": 2, "style": 2, "title": "손절가"},
-                {"price": p["tp"], "color": "#00D084", "width": 2, "style": 2, "title": "목표가"},
-                {"price": p["fib_618"], "color": "#FFA657", "width": 1, "style": 1, "title": "Fib 0.618"},
-                {"price": p["fib_382"], "color": "#D2A8FF", "width": 1, "style": 1, "title": "Fib 0.382"}
+                {"price": p["tp"], "color": "#00D084", "width": 2, "style": 2, "title": "🎯 목표가"},
+                {"price": p["w1_inv"], "color": "#FF7B72", "width": 1, "style": 2, "title": "⚠️ 1파고점(무효화)"},
+                {"price": p["fib_1618"], "color": "#58A6FF", "width": 1, "style": 1, "title": "🎯 Fib 1.618"}
             ]
             render_tv_candle_chart(p["df_4h"].tail(90), f"tv_pick_{idx}", price_lines=chart_lines, show_ema=True, show_waves=True, height=340)
 
-# ---------------- TAB 3: 한글 미국 경제 일정 ----------------
-with tab3:
-    st.markdown("#### 📅 이번 주 미국 주요 경제지표 발표 (한국시간)")
-    st.caption("중요 지표 발표 전후 30분은 위아래 꼬리(휩쏘) 주의 구간입니다.")
-    events = get_korean_econ_calendar()
-    if not events:
-        st.info("이번 주 예정된 주요 미국 경제지표 일정을 불러오는 중입니다.")
-    else:
-        for ev in events:
-            st.markdown(f"""
-            <div class="news-card">
-                <div style="display:flex; justify-content:space-between; font-size:0.78rem; color:#8B949E;">
-                    <span>{ev['importance']} &nbsp;|&nbsp; {ev['time']}</span>
-                    <span>예상: <b style="color:#F0F6FC;">{ev['forecast']}</b> / 이전: {ev['previous']}</span>
-                </div>
-                <div style="font-size:0.98rem; font-weight:bold; color:#F0F6FC; margin:4px 0;">{ev['title']}</div>
-                <div style="font-size:0.82rem; color:#79C0FF;">💡 {ev['desc']}</div>
-            </div>""", unsafe_allow_html=True)
-
-# ---------------- TAB 4: 코인니스 스타일 경제·속보 ----------------
-with tab4:
+@st.fragment(run_every="45s")
+def live_news_section():
     st.markdown("#### 🇺🇸 미국 증시 vs 비트코인 실시간 흐름")
     us_idx = get_us_indices()
     u1, u2 = st.columns(2)
@@ -849,7 +831,7 @@ with tab4:
             <div style="font-size:0.82rem; color:{c_col};">{info['chg']:+.2f}%</div>
         </div>""", unsafe_allow_html=True)
 
-    st.markdown("#### ⚡ 실시간 경제·코인 속보 (호재·악재 판독)")
+    st.markdown(f"#### ⚡ 실시간 경제·코인 속보 (45초마다 자동 업데이트 · {datetime.now(KST).strftime('%H:%M:%S')})")
     news_list = fetch_coinness_style_news()
     if not news_list:
         st.info("최신 속보를 불러오는 중입니다.")
@@ -869,7 +851,73 @@ with tab4:
                 </div>
             </div>""", unsafe_allow_html=True)
 
-# ---------------- TAB 5: 구글 시트 연동 매매일지 ----------------
+# ================= 7. 메인 화면 렌더링 =================
+st.markdown("### 📡 코인 선물 레이더")
+st.caption("새로고침 없이 시세 · 수급 · 추천 종목 · 속보가 백그라운드에서 실시간 자동 반영됩니다.")
+
+live_top_header_section()
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 시장 브리핑", "🎯 추천 종목", "📅 경제 일정", "📰 경제·속보", "📝 매매일지"])
+
+with tab1:
+    halving_date = datetime(2024, 4, 20, tzinfo=KST)
+    days_passed = (datetime.now(KST) - halving_date).days
+    progress = min(days_passed / 1460, 1.0)
+    st.markdown(f"""
+    <div class="metric-card">
+        <div style="font-weight:bold; color:#F0F6FC; margin-bottom:4px;">⏳ 비트코인 반감기 & 거시 싸이클</div>
+        <div style="font-size:0.86rem; color:#FFA657;">4차 반감기 후 <b>{days_passed}일 경과</b></div>
+        <div class="reason-box">
+            <span class="badge-neutral">⚪ 거시 싸이클 해석</span><br>
+            반감기 이후 12~18개월 사이 대형 고점을 형성한 뒤 약 1년간 거시 조정 파동이 진행됩니다. 청산 빔 왜곡이 없는 <b>현물(Spot) 차트 기준 파동·피보나치 목표가</b>를 먼저 확인하세요.
+        </div>
+    </div>""", unsafe_allow_html=True)
+    st.progress(progress)
+
+    st.markdown("#### 🕯️ 비트코인 현물(Spot) 엘리어트 파동 & 피보나치 예측")
+    tf_tabs = st.tabs(["월봉 (거시)", "주봉 (중장기)", "일봉 (스윙)", "4시간봉 (단기)"])
+    tf_configs = [
+        ("1M", 120, "월봉(1M) 현물", "tv_btc_1m"),
+        ("1w", 160, "주봉(1W) 현물", "tv_btc_1w"),
+        ("1d", 160, "일봉(1D) 현물", "tv_btc_1d"),
+        ("4h", 160, "4시간봉(4H) 현물", "tv_btc_4h")
+    ]
+    for t_tab, (interval, lim, label, cid) in zip(tf_tabs, tf_configs):
+        with t_tab:
+            try:
+                df_tf = calc_indicators(fetch_spot_klines("BTCUSDT", interval, lim))
+                html_desc, chart_lines, _, _, _, _, _ = analyze_spot_wave_and_fib(df_tf, label)
+                render_tv_candle_chart(df_tf, cid, price_lines=chart_lines, show_ema=True, show_waves=True, height=340)
+                st.markdown(f'<div class="reason-box">{html_desc}</div>', unsafe_allow_html=True)
+            except Exception:
+                st.warning(f"{label} 데이터를 불러오는 중입니다.")
+
+    live_cvd_and_firechart_section()
+
+with tab2:
+    live_recommendations_section()
+
+with tab3:
+    st.markdown("#### 📅 이번 주 미국 주요 경제지표 발표 (한국시간)")
+    st.caption("중요 지표 발표 전후 30분은 위아래 꼬리(휩쏘) 주의 구간입니다.")
+    events = get_korean_econ_calendar()
+    if not events:
+        st.info("이번 주 예정된 주요 미국 경제지표 일정을 불러오는 중입니다.")
+    else:
+        for ev in events:
+            st.markdown(f"""
+            <div class="news-card">
+                <div style="display:flex; justify-content:space-between; font-size:0.78rem; color:#8B949E;">
+                    <span>{ev['importance']} &nbsp;|&nbsp; {ev['time']}</span>
+                    <span>예상: <b style="color:#F0F6FC;">{ev['forecast']}</b> / 이전: {ev['previous']}</span>
+                </div>
+                <div style="font-size:0.98rem; font-weight:bold; color:#F0F6FC; margin:4px 0;">{ev['title']}</div>
+                <div style="font-size:0.82rem; color:#79C0FF;">💡 {ev['desc']}</div>
+            </div>""", unsafe_allow_html=True)
+
+with tab4:
+    live_news_section()
+
 with tab5:
     st.markdown("#### 📝 매매일지 및 성과 분석")
     sheet_url = st.secrets.get("SHEET_URL", "")
@@ -893,7 +941,7 @@ with tab5:
             "적용 근거 태그",
             ["AI추천종목", "엘리어트파동", "피보나치", "EMA이평선", "RSI", "MACD", "CVD/수급", "경제속보", "직접판단"]
         )
-        memo_in = st.text_input("복기 메모", placeholder="예: CPI 발표 후 나스닥 반등 확인 후 롱 진입")
+        memo_in = st.text_input("복기 메모", placeholder="예: 현물 1파 고점 지지 확인 후 롱 진입")
         submitted = st.form_submit_button("💾 구글 시트에 기록 저장", use_container_width=True)
 
         if submitted:
