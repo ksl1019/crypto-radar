@@ -693,7 +693,7 @@ with tab1:
     except Exception:
         st.warning("CVD 수급 차트를 불러오는 중입니다.")
 
-st.markdown("#### 🔥 파이어차트 (실시간 호가창 유동성 매물벽 히트맵)")
+    st.markdown("#### 🔥 파이어차트 (실시간 호가창 유동성 매물벽 히트맵)")
     try:
         heatmap_df, top_bid_p, top_bid_v, top_ask_p, top_ask_v = get_orderbook_heatmap("BTCUSDT")
         max_notional = heatmap_df["notional"].max() + 1e-9
