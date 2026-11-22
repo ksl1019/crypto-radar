@@ -69,6 +69,64 @@ st.markdown("""
 
 KST = timezone(timedelta(hours=9))
 
+# ================= 영구 설정 저장(브라우저 localStorage + URL 동기화) =================
+def init_and_sync_persistent_goals(default_seed):
+    qp = st.query_params
+    if "goal_target" not in st.session_state:
+        try:
+            st.session_state["goal_target"] = float(qp.get("gt", round(default_seed * 2.0, 2)))
+        except Exception:
+            st.session_state["goal_target"] = round(default_seed * 2.0, 2)
+    if "goal_days" not in st.session_state:
+        try:
+            st.session_state["goal_days"] = int(qp.get("gd", 30))
+        except Exception:
+            st.session_state["goal_days"] = 30
+    if "goal_ratio_idx" not in st.session_state:
+        try:
+            st.session_state["goal_ratio_idx"] = int(qp.get("gr", 0))
+        except Exception:
+            st.session_state["goal_ratio_idx"] = 0
+
+    # 브라우저 localStorage 복원 (URL 파라미터가 없을 때 저장된 값 자동 주입)
+    restore_js = """
+    <script>
+      try {
+        const url = new URL(window.parent.location.href);
+        const savedGt = localStorage.getItem('cr_goal_target');
+        const savedGd = localStorage.getItem('cr_goal_days');
+        const savedGr = localStorage.getItem('cr_goal_ratio');
+        let changed = false;
+        if (!url.searchParams.has('gt') && savedGt) { url.searchParams.set('gt', savedGt); changed = true; }
+        if (!url.searchParams.has('gd') && savedGd) { url.searchParams.set('gd', savedGd); changed = true; }
+        if (!url.searchParams.has('gr') && savedGr) { url.searchParams.set('gr', savedGr); changed = true; }
+        if (changed) { window.parent.location.replace(url.toString()); }
+      } catch (e) {}
+    </script>
+    """
+    components.html(restore_js, height=0)
+
+def save_persistent_goals(gt_val, gd_val, gr_idx):
+    st.session_state["goal_target"] = float(gt_val)
+    st.session_state["goal_days"] = int(gd_val)
+    st.session_state["goal_ratio_idx"] = int(gr_idx)
+    try:
+        st.query_params["gt"] = str(round(float(gt_val), 2))
+        st.query_params["gd"] = str(int(gd_val))
+        st.query_params["gr"] = str(int(gr_idx))
+    except Exception:
+        pass
+    save_js = f"""
+    <script>
+      try {{
+        localStorage.setItem('cr_goal_target', '{round(float(gt_val), 2)}');
+        localStorage.setItem('cr_goal_days', '{int(gd_val)}');
+        localStorage.setItem('cr_goal_ratio', '{int(gr_idx)}');
+      }} catch (e) {{}}
+    </script>
+    """
+    components.html(save_js, height=0)
+
 def safe_get_json(url, headers=None, timeout=4):
     try:
         return requests.get(url, headers=headers, timeout=timeout).json()
@@ -115,7 +173,6 @@ def load_sheet_state():
             tag_col = df_all["근거태그"].astype(str)
             memo_col = df_all["메모"].astype(str)
 
-            # 1) 총 증거금(지갑 잔고) 스냅샷
             bal_mask = tag_col.str.startswith("BAL_SNAPSHOT|")
             df_bal = df_all[bal_mask]
             if not df_bal.empty:
@@ -124,7 +181,6 @@ def load_sheet_state():
                 state["avail_bal"] = float(pd.to_numeric(last_b["진입가"], errors="coerce") or 0)
                 state["used_margin"] = float(pd.to_numeric(last_b["종료가"], errors="coerce") or 0)
 
-            # 2) 현재 보유 포지션 스냅샷
             open_mask = tag_col.str.startswith("OPEN_SNAPSHOT|") | memo_col.str.startswith("OPEN_SNAPSHOT|")
             df_open = df_all[tag_col.str.startswith("OPEN_SNAPSHOT|")].copy()
             if not df_open.empty:
@@ -132,7 +188,6 @@ def load_sheet_state():
                 cur_open = df_open[(df_open["근거태그"] == latest_batch) & (df_open["종목"] != "NONE")]
                 state["open_list"] = cur_open.to_dict("records")
 
-            # 3) 실제 종료된 매매 기록
             exclude_mask = bal_mask | open_mask | (df_all["종목"].isin(["WALLET", "NONE"]))
             df_closed = df_all[~exclude_mask].copy()
             if not df_closed.empty:
@@ -262,10 +317,10 @@ def get_macro_indices():
                 indices[name] = {"price": "N/A", "chg": 0.0}
     return indices
 
-@st.cache_data(ttl=120)
-def fetch_spot_klines(symbol, interval, limit=250):
+@st.cache_data(ttl=90)
+def fetch_spot_klines(symbol, interval, limit=450):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = requests.get(url, timeout=4).json()
+    data = requests.get(url, timeout=5).json()
     df = pd.DataFrame(data, columns=[
         "time", "open", "high", "low", "close", "volume",
         "close_time", "qav", "num_trades", "taker_base_vol", "taker_quote_vol", "ignore"
@@ -329,21 +384,17 @@ def fmt_p(val):
     return f"${val:,.4f}" if val < 10 else f"${val:,.1f}"
 
 def analyze_spot_swing_fib(df, tf_name):
-    sub = df.tail(150).copy().reset_index(drop=True)
+    sub = df.tail(180).copy().reset_index(drop=True)
     last_close = float(sub["close"].iloc[-1])
     ema25 = float(sub["ema25"].iloc[-1])
-    ema99 = float(sub["ema99"].iloc[-1])
     rsi_val = float(sub["rsi"].iloc[-1]) if not np.isnan(sub["rsi"].iloc[-1]) else 50.0
 
-    # 최근 150캔들 내 주요 스윙 저점·고점 추출
     swing_low = float(sub["low"].min())
     low_idx = int(sub["low"].idxmin())
     swing_high = float(sub["high"].max())
     high_idx = int(sub["high"].idxmax())
 
-    # 상승 스윙(저점이 고점보다 먼저 발생) vs 하락 스윙(고점이 저점보다 먼저 발생) 판별
     if low_idx < high_idx:
-        # 상승 구간 후 되돌림 상태
         swing_range = max(swing_high - swing_low, 1e-9)
         fib_382 = swing_high - swing_range * 0.382
         fib_500 = swing_high - swing_range * 0.500
@@ -357,7 +408,7 @@ def analyze_spot_swing_fib(df, tf_name):
         if last_close >= fib_618 and last_close > ema25:
             badge = f'<span class="badge-long">🟢 {tf_name} 상승 추세 · 피보나치 지지 유효</span>'
             main_scen = (
-                f"스윙 저점(<b>{fmt_p(swing_low)}</b>)→고점(<b>{fmt_p(swing_high)}</b>) 상승폭 대비 핵심 눌림목 지지선인 "
+                f"최근 1달 스윙 저점(<b>{fmt_p(swing_low)}</b>)→고점(<b>{fmt_p(swing_high)}</b>) 상승폭 대비 핵심 눌림목 지지선인 "
                 f"<b>피보나치 0.618({fmt_p(fib_618)})</b> 및 EMA 25 상단을 지키고 있습니다. "
                 f"직전 고점 돌파 시 1차 확장 목표는 <b>{fmt_p(fib_ext_1272)} ({up_1272_pct:+.1f}%)</b>, "
                 f"1.618 확장 목표는 <b>{fmt_p(fib_ext_1618)} ({up_1618_pct:+.1f}%)</b>입니다."
@@ -385,7 +436,6 @@ def analyze_spot_swing_fib(df, tf_name):
             {"price": fib_ext_1618, "color": "#7EE787", "width": 1, "style": 1, "title": "🎯 확장 1.618"}
         ]
     else:
-        # 하락 스윙 후 반등/추가 하락 상태
         swing_range = max(swing_high - swing_low, 1e-9)
         fib_382 = swing_low + swing_range * 0.382
         fib_500 = swing_low + swing_range * 0.500
@@ -397,7 +447,7 @@ def analyze_spot_swing_fib(df, tf_name):
         if last_close <= fib_618 and last_close < ema25:
             badge = f'<span class="badge-short">🔴 {tf_name} 하락 추세 · 피보나치 저항 유효</span>'
             main_scen = (
-                f"스윙 고점(<b>{fmt_p(swing_high)}</b>)→저점(<b>{fmt_p(swing_low)}</b>) 하락폭의 되돌림 저항선인 "
+                f"최근 1달 스윙 고점(<b>{fmt_p(swing_high)}</b>)→저점(<b>{fmt_p(swing_low)}</b>) 하락폭의 되돌림 저항선인 "
                 f"<b>피보나치 0.618({fmt_p(fib_618)})</b> 및 EMA 25 저항 아래에 눌려 있습니다. "
                 f"저점 이탈 시 하방 확장 목표는 <b>{fmt_p(fib_down_1272)} ({dn_pct:+.1f}%)</b> 구간입니다."
             )
@@ -437,18 +487,41 @@ def analyze_spot_swing_fib(df, tf_name):
         "is_uptrend_structure": low_idx < high_idx
     }
 
-# ================= 4. 트레이딩뷰 모바일 캔들 & CVD 차트 렌더러 =================
-def render_tv_candle_chart(df, chart_id, watermark_text="", price_lines=None, show_ema=True, height=380):
+# ================= 4. 실시간 웹소켓 캔들 + 보조지표(거래량·RSI·MACD) 차트 렌더러 =================
+def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_symbol=None, live_interval="4h", show_indicators=True, height=480):
     sub = df.copy().reset_index(drop=True)
     candles = [
         {"time": int(r["ts"]), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])}
         for _, r in sub.iterrows()
     ]
+    vols = [
+        {
+            "time": int(r["ts"]),
+            "value": float(r["volume"]),
+            "color": "rgba(0, 208, 132, 0.45)" if float(r["close"]) >= float(r["open"]) else "rgba(255, 75, 75, 0.45)"
+        }
+        for _, r in sub.iterrows()
+    ]
     ema7_data = [{"time": int(r["ts"]), "value": float(r["ema7"])} for _, r in sub.iterrows() if not np.isnan(r["ema7"])]
     ema25_data = [{"time": int(r["ts"]), "value": float(r["ema25"])} for _, r in sub.iterrows() if not np.isnan(r["ema25"])]
     ema99_data = [{"time": int(r["ts"]), "value": float(r["ema99"])} for _, r in sub.iterrows() if not np.isnan(r["ema99"])]
+    rsi_data = [{"time": int(r["ts"]), "value": float(r["rsi"])} for _, r in sub.iterrows() if not np.isnan(r["rsi"])]
+    macd_data = [{"time": int(r["ts"]), "value": float(r["macd"])} for _, r in sub.iterrows() if not np.isnan(r["macd"])]
+    sig_data = [{"time": int(r["ts"]), "value": float(r["signal"])} for _, r in sub.iterrows() if not np.isnan(r["signal"])]
+    hist_data = [
+        {
+            "time": int(r["ts"]),
+            "value": float(r["hist"]),
+            "color": "rgba(0, 208, 132, 0.65)" if float(r["hist"]) >= 0 else "rgba(255, 75, 75, 0.65)"
+        }
+        for _, r in sub.iterrows() if not np.isnan(r["hist"])
+    ]
 
     last_price = float(sub["close"].iloc[-1])
+    last_rsi = float(sub["rsi"].iloc[-1]) if not np.isnan(sub["rsi"].iloc[-1]) else 50.0
+    last_macd = float(sub["macd"].iloc[-1]) if not np.isnan(sub["macd"].iloc[-1]) else 0.0
+    last_sig = float(sub["signal"].iloc[-1]) if not np.isnan(sub["signal"].iloc[-1]) else 0.0
+
     if last_price < 1:
         prec, min_move = 4, 0.0001
     elif last_price < 50:
@@ -457,49 +530,88 @@ def render_tv_candle_chart(df, chart_id, watermark_text="", price_lines=None, sh
         prec, min_move = 2, 0.01
 
     lines_json = json.dumps(price_lines or [])
-    ema_flag = "true" if show_ema else "false"
     wm_flag = "true" if watermark_text else "false"
+    ws_sym = str(live_symbol).lower() if live_symbol else ""
+    ind_flag = "true" if show_indicators else "false"
+
+    main_h = int(height * 0.58) if show_indicators else height
+    rsi_h = int(height * 0.21) if show_indicators else 0
+    macd_h = int(height * 0.21) if show_indicators else 0
+
+    sub_panels_html = ""
+    if show_indicators:
+        sub_panels_html = f"""
+        <div style="font-size:11px; color:#8B949E; padding:4px 8px 2px 8px; background:#0D1117; border-top:1px solid #21262D; display:flex; justify-content:space-between;">
+          <span>📊 RSI (14) <span style="color:#E3B341;">■</span></span>
+          <span>현재 RSI: <b id="{chart_id}_rsi_txt" style="color:#F0F6FC;">{last_rsi:.1f}</b> (과매수 70 / 과매도 30)</span>
+        </div>
+        <div id="{chart_id}_rsi" style="width: 100%; height: {rsi_h}px; background: #0D1117;"></div>
+        <div style="font-size:11px; color:#8B949E; padding:4px 8px 2px 8px; background:#0D1117; border-top:1px solid #21262D; display:flex; justify-content:space-between;">
+          <span>📉 MACD (12, 26, 9) · <span style="color:#58A6FF;">MACD</span> / <span style="color:#FFA657;">Signal</span></span>
+          <span id="{chart_id}_macd_txt" style="color:#C9D1D9;">{last_macd:.4f} / {last_sig:.4f}</span>
+        </div>
+        <div id="{chart_id}_macd" style="width: 100%; height: {macd_h}px; background: #0D1117;"></div>
+        """
 
     html_code = f"""
-    <div id="{chart_id}" style="width: 100%; height: {height}px; background: #0D1117; border-radius: 10px; overflow: hidden;"></div>
+    <div style="border:1px solid #30363D; border-radius:10px; overflow:hidden; background:#0D1117; font-family:sans-serif;">
+      <div style="font-size:11px; color:#8B949E; padding:5px 8px; background:#161B22; display:flex; justify-content:space-between; align-items:center;">
+        <span>🕯️ 캔들 + 거래량 · <span style="color:#58A6FF;">EMA7</span> / <span style="color:#F2CC60;">EMA25</span> / <span style="color:#FF7B72;">EMA99</span></span>
+        <span style="color:#00D084; font-weight:bold;">● 1초 실시간 연동</span>
+      </div>
+      <div id="{chart_id}_main" style="width: 100%; height: {main_h}px; background: #0D1117;"></div>
+      {sub_panels_html}
+    </div>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
-      const container = document.getElementById('{chart_id}');
-      const initW = container.clientWidth || window.innerWidth || 560;
-      const chart = LightweightCharts.createChart(container, {{
+      const mainEl = document.getElementById('{chart_id}_main');
+      const initW = mainEl.clientWidth || window.innerWidth || 560;
+
+      const commonOpts = {{
         width: initW,
-        height: {height},
         layout: {{ background: {{ color: '#0D1117' }}, textColor: '#C9D1D9' }},
+        grid: {{ vertLines: {{ color: '#1F242C' }}, horzLines: {{ color: '#1F242C' }} }},
+        rightPriceScale: {{ borderColor: '#30363D', minimumWidth: 68 }},
+        timeScale: {{ borderColor: '#30363D', timeVisible: true, secondsVisible: false, rightOffset: 4, minBarSpacing: 0.4 }},
+        handleScroll: {{ mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false }},
+        handleScale: {{ axisPressedMouseMove: true, mouseWheel: true, pinch: true }}
+      }};
+
+      const mainChart = LightweightCharts.createChart(mainEl, {{
+        ...commonOpts,
+        height: {main_h},
         watermark: {{
           visible: {wm_flag},
-          fontSize: 22,
+          fontSize: 20,
           horzAlign: 'center',
           vertAlign: 'center',
           color: 'rgba(255, 255, 255, 0.08)',
           text: '{watermark_text}'
-        }},
-        grid: {{ vertLines: {{ color: '#1F242C' }}, horzLines: {{ color: '#1F242C' }} }},
-        crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
-        rightPriceScale: {{ borderColor: '#30363D' }},
-        timeScale: {{ borderColor: '#30363D', timeVisible: true, secondsVisible: false, rightOffset: 5 }},
-        handleScroll: {{ mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false }},
-        handleScale: {{ axisPressedMouseMove: true, mouseWheel: true, pinch: true }}
+        }}
       }});
-      const candleSeries = chart.addCandlestickSeries({{
+
+      const candleSeries = mainChart.addCandlestickSeries({{
         upColor: '#00D084', downColor: '#FF4B4B', borderVisible: false,
         wickUpColor: '#00D084', wickDownColor: '#FF4B4B',
         priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }}
       }});
       candleSeries.setData({json.dumps(candles)});
 
-      if ({ema_flag}) {{
-        const s7 = chart.addLineSeries({{ color: '#58A6FF', lineWidth: 1, title: 'EMA7', priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
-        s7.setData({json.dumps(ema7_data)});
-        const s25 = chart.addLineSeries({{ color: '#F2CC60', lineWidth: 1.5, title: 'EMA25', priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
-        s25.setData({json.dumps(ema25_data)});
-        const s99 = chart.addLineSeries({{ color: '#FF7B72', lineWidth: 1.5, title: 'EMA99', priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
-        s99.setData({json.dumps(ema99_data)});
-      }}
+      const volSeries = mainChart.addHistogramSeries({{
+        priceFormat: {{ type: 'volume' }},
+        priceScaleId: 'vol'
+      }});
+      mainChart.priceScale('vol').applyOptions({{
+        scaleMargins: {{ top: 0.80, bottom: 0 }}
+      }});
+      volSeries.setData({json.dumps(vols)});
+
+      const s7 = mainChart.addLineSeries({{ color: '#58A6FF', lineWidth: 1, priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
+      s7.setData({json.dumps(ema7_data)});
+      const s25 = mainChart.addLineSeries({{ color: '#F2CC60', lineWidth: 1.5, priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
+      s25.setData({json.dumps(ema25_data)});
+      const s99 = mainChart.addLineSeries({{ color: '#FF7B72', lineWidth: 1.5, priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
+      s99.setData({json.dumps(ema99_data)});
 
       const priceLines = {lines_json};
       priceLines.forEach(pl => {{
@@ -508,24 +620,87 @@ def render_tv_candle_chart(df, chart_id, watermark_text="", price_lines=None, sh
           lineStyle: pl.style || 2, axisLabelVisible: true, title: pl.title
         }});
       }});
-      chart.timeScale().fitContent();
+      mainChart.timeScale().fitContent();
+
+      let rsiChart = null, macdChart = null;
+      if ({ind_flag}) {{
+        const rsiEl = document.getElementById('{chart_id}_rsi');
+        rsiChart = LightweightCharts.createChart(rsiEl, {{
+          ...commonOpts,
+          height: {rsi_h},
+          timeScale: {{ ...commonOpts.timeScale, visible: false }}
+        }});
+        const rsiSeries = rsiChart.addLineSeries({{ color: '#E3B341', lineWidth: 1.5 }});
+        rsiSeries.setData({json.dumps(rsi_data)});
+        rsiSeries.createPriceLine({{ price: 70, color: 'rgba(255, 75, 75, 0.5)', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' }});
+        rsiSeries.createPriceLine({{ price: 30, color: 'rgba(0, 208, 132, 0.5)', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' }});
+        rsiChart.timeScale().fitContent();
+
+        const macdEl = document.getElementById('{chart_id}_macd');
+        macdChart = LightweightCharts.createChart(macdEl, {{
+          ...commonOpts,
+          height: {macd_h}
+        }});
+        const histSeries = macdChart.addHistogramSeries({{}});
+        histSeries.setData({json.dumps(hist_data)});
+        const macdLine = macdChart.addLineSeries({{ color: '#58A6FF', lineWidth: 1.3 }});
+        macdLine.setData({json.dumps(macd_data)});
+        const sigLine = macdChart.addLineSeries({{ color: '#FFA657', lineWidth: 1.3 }});
+        sigLine.setData({json.dumps(sig_data)});
+        macdChart.timeScale().fitContent();
+
+        // 메인 차트와 보조지표 타임스케일 좌우 스크롤·줌 동기화
+        mainChart.timeScale().subscribeVisibleLogicalRangeChange(range => {{
+          if (range) {{
+            rsiChart.timeScale().setVisibleLogicalRange(range);
+            macdChart.timeScale().setVisibleLogicalRange(range);
+          }}
+        }});
+      }}
+
+      // 바이낸스 실시간 캔들 웹소켓 연결 (마지막 캔들 1초 단위 실시간 갱신)
+      const wsSym = '{ws_sym}';
+      const wsIntv = '{live_interval}';
+      if (wsSym) {{
+        function connectKlineWS() {{
+          const ws = new WebSocket('wss://stream.binance.com:9443/ws/' + wsSym + '@kline_' + wsIntv);
+          ws.onmessage = (ev) => {{
+            const msg = JSON.parse(ev.data);
+            if (!msg.k) return;
+            const k = msg.k;
+            const tSec = Math.floor(k.t / 1000) + (9 * 3600);
+            const o = parseFloat(k.o), h = parseFloat(k.h), l = parseFloat(k.l), c = parseFloat(k.c), v = parseFloat(k.v);
+            candleSeries.update({{ time: tSec, open: o, high: h, low: l, close: c }});
+            volSeries.update({{
+              time: tSec,
+              value: v,
+              color: c >= o ? 'rgba(0, 208, 132, 0.45)' : 'rgba(255, 75, 75, 0.45)'
+            }});
+          }};
+          ws.onclose = () => setTimeout(connectKlineWS, 3000);
+        }}
+        connectKlineWS();
+      }}
 
       const ro = new ResizeObserver(entries => {{
         for (let entry of entries) {{
           const w = entry.contentRect.width;
           if (w > 10) {{
-            chart.resize(w, {height});
-            chart.timeScale().fitContent();
+            mainChart.resize(w, {main_h});
+            mainChart.timeScale().fitContent();
+            if (rsiChart) {{ rsiChart.resize(w, {rsi_h}); rsiChart.timeScale().fitContent(); }}
+            if (macdChart) {{ macdChart.resize(w, {macd_h}); macdChart.timeScale().fitContent(); }}
           }}
         }}
       }});
-      ro.observe(container);
+      ro.observe(mainEl);
     </script>
     """
-    components.html(html_code, height=height + 6)
+    total_h = height + (52 if show_indicators else 34)
+    components.html(html_code, height=total_h)
 
 def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
-    sub = df.tail(140).copy().reset_index(drop=True)
+    sub = df.tail(240).copy().reset_index(drop=True)
     cvd_data = [{"time": int(r["ts"]), "value": float(r["cvd"])} for _, r in sub.iterrows()]
     html_code = f"""
     <div id="{chart_id}" style="width: 100%; height: {height}px; background: #0D1117; border-radius: 10px; overflow: hidden;"></div>
@@ -543,11 +718,11 @@ def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
           horzAlign: 'center',
           vertAlign: 'center',
           color: 'rgba(255, 255, 255, 0.08)',
-          text: 'BTCUSDT · 4H CVD'
+          text: 'BTCUSDT · 4H CVD (40일)'
         }},
         grid: {{ vertLines: {{ color: '#1F242C' }}, horzLines: {{ color: '#1F242C' }} }},
         rightPriceScale: {{ borderColor: '#30363D' }},
-        timeScale: {{ borderColor: '#30363D', timeVisible: true, secondsVisible: false }},
+        timeScale: {{ borderColor: '#30363D', timeVisible: true, secondsVisible: false, minBarSpacing: 0.4 }},
         handleScroll: {{ mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false }},
         handleScale: {{ axisPressedMouseMove: true, mouseWheel: true, pinch: true }}
       }});
@@ -603,8 +778,8 @@ def calc_goal_adjusted_leverage(entry, sl, tp, entry_margin, daily_goal_usd, bet
 
 def analyze_single_alt(sym, btc_ret, btc_dir):
     try:
-        df_1d = calc_indicators(fetch_spot_klines(sym, "1d", 200))
-        df_4h = calc_indicators(fetch_spot_klines(sym, "4h", 250))
+        df_1d = calc_indicators(fetch_spot_klines(sym, "1d", 250))
+        df_4h = calc_indicators(fetch_spot_klines(sym, "4h", 450))
         a1d, a4h, pa4h = df_1d.iloc[-1], df_4h.iloc[-1], df_4h.iloc[-2]
         price, atr = float(a4h["close"]), float(a4h["atr"])
 
@@ -622,7 +797,6 @@ def analyze_single_alt(sym, btc_ret, btc_dir):
 
         reasons, direction, score = [], None, 0
 
-        # 롱 조건: 일봉·4시간봉 정배열 + 핵심 피보나치 0.618 지지선 위에서 방어 중일 때만 추천
         if a1d["close"] > a1d["ema25"] and a4h["ema7"] > a4h["ema25"] and 42 <= a4h["rsi"] <= 68 and price > fib_618:
             score += 3
             reasons.append(f"• <b>일봉·4시간봉 추세 정배열:</b> EMA 7 > 25 정배열 및 RSI({a4h['rsi']:.1f}) 건강한 상승 흐름입니다.")
@@ -638,7 +812,6 @@ def analyze_single_alt(sym, btc_ret, btc_dir):
             if score >= 4:
                 direction = "LONG"
 
-        # 숏 조건: 일봉·4시간봉 역배열 + 핵심 피보나치 0.618 저항선 아래일 때만 추천
         elif a1d["close"] < a1d["ema25"] and a4h["ema7"] < a4h["ema25"] and 32 <= a4h["rsi"] <= 58 and price < fib_618:
             score += 3
             reasons.append(f"• <b>일봉·4시간봉 추세 역배열:</b> EMA 7 < 25 저항 아래에서 RSI({a4h['rsi']:.1f}) 하방 압력이 우세합니다.")
@@ -675,7 +848,7 @@ def analyze_single_alt(sym, btc_ret, btc_dir):
 
 @st.cache_data(ttl=300)
 def scan_all_markets(overview):
-    btc_4h = calc_indicators(fetch_spot_klines("BTCUSDT", "4h", 250))
+    btc_4h = calc_indicators(fetch_spot_klines("BTCUSDT", "4h", 450))
     c4h = btc_4h.iloc[-1]
     btc_price = float(c4h["close"])
     btc_atr = float(c4h["atr"])
@@ -1132,9 +1305,9 @@ def live_top_header_section():
 
 @st.fragment(run_every="60s")
 def live_cvd_and_firechart_section():
-    st.markdown("#### 📈 BTC 현물 누적 거래량 델타 (CVD · 4시간봉 기준 · 1분 갱신)")
+    st.markdown("#### 📈 BTC 현물 누적 거래량 델타 (CVD · 4시간봉 40일치 · 1분 갱신)")
     try:
-        btc_4h_df = calc_indicators(fetch_spot_klines("BTCUSDT", "4h", 200))
+        btc_4h_df = calc_indicators(fetch_spot_klines("BTCUSDT", "4h", 360))
         render_tv_cvd_chart(btc_4h_df, "tv_btc_cvd", height=220)
 
         price_up = btc_4h_df["close"].iloc[-1] > btc_4h_df["close"].iloc[-6]
@@ -1194,32 +1367,33 @@ def live_recommendations_section():
     avail_bal = acc_state["avail_bal"]
     base_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else (max(10.0, round(avail_bal, 2)) if avail_bal > 0 else 100.0)
 
-    if "goal_target" not in st.session_state:
-        st.session_state["goal_target"] = round(base_seed * 2.0, 2)
-    if "goal_days" not in st.session_state:
-        st.session_state["goal_days"] = 30
+    init_and_sync_persistent_goals(base_seed)
 
-    st.markdown("#### 🎯 내 시드 · 복리 목표 연동 자동 세팅")
+    st.markdown("#### 🎯 내 시드 · 복리 목표 연동 자동 세팅 (설정값 자동 저장)")
     g1, g2, g3 = st.columns(3)
     cur_seed_disp = g1.number_input("현재 총 시드 ($)", min_value=10.0, value=base_seed, step=10.0, key="rec_seed_in")
     target_goal = g2.number_input("목표 금액 ($)", min_value=cur_seed_disp + 5.0, value=max(cur_seed_disp + 5.0, float(st.session_state["goal_target"])), step=10.0, key="rec_target_in")
     target_days = g3.number_input("목표 기간 (일)", min_value=3, max_value=365, value=int(st.session_state["goal_days"]), step=5, key="rec_days_in")
 
-    st.session_state["goal_target"] = target_goal
-    st.session_state["goal_days"] = target_days
+    ratio_opts = ["시드 25% (권장)", "시드 50% (분할 2회)", "시드 100% (전액)"]
+    saved_r_idx = min(2, max(0, int(st.session_state.get("goal_ratio_idx", 0))))
+    ratio_choice = st.radio("💰 1회 진입 증거금 비중", ratio_opts, index=saved_r_idx, horizontal=True, key="rec_ratio_in")
+    cur_r_idx = ratio_opts.index(ratio_choice)
+
+    if (
+        abs(target_goal - float(st.session_state["goal_target"])) > 0.001
+        or target_days != int(st.session_state["goal_days"])
+        or cur_r_idx != int(st.session_state["goal_ratio_idx"])
+    ):
+        save_persistent_goals(target_goal, target_days, cur_r_idx)
 
     growth_mult = target_goal / cur_seed_disp
     req_daily_pct = ((growth_mult ** (1.0 / target_days)) - 1.0) * 100.0
     daily_goal_usd = cur_seed_disp * (req_daily_pct / 100.0)
 
-    ratio_choice = st.radio(
-        "💰 1회 진입 증거금 비중",
-        ["시드 25% (권장)", "시드 50% (분할 2회)", "시드 100% (전액)"],
-        horizontal=True
-    )
-    if ratio_choice == "시드 25% (권장)":
+    if cur_r_idx == 0:
         entry_margin = round(cur_seed_disp * 0.25, 2)
-    elif ratio_choice == "시드 50% (분할 2회)":
+    elif cur_r_idx == 1:
         entry_margin = round(cur_seed_disp * 0.50, 2)
     else:
         entry_margin = round(cur_seed_disp, 2)
@@ -1231,7 +1405,7 @@ def live_recommendations_section():
             1회 진입 증거금: <b style="color:#58A6FF;">${entry_margin:,.2f}</b>
         </div>
         <div style="font-size:0.76rem; color:#8B949E; margin-top:3px;">
-            모든 추천 종목은 <b>일봉(1D) · 4시간봉(4H) 현물 추세 + 피보나치 지지·저항</b> 기준으로 스캔됩니다.
+            목표 금액·기간·비중은 앱을 껐다 켜도 유지됩니다. · <b>4시간봉(4H) 실시간 차트 + 거래량·RSI·MACD</b> 지원
         </div>
     </div>""", unsafe_allow_html=True)
 
@@ -1277,8 +1451,9 @@ def live_recommendations_section():
             </div>
         </div>""", unsafe_allow_html=True)
 
-        with st.expander(f"🕯️ {p['raw_symbol']} · 4시간봉(4H) 현물 차트 보기 (최근 220캔들 · 약 36일 흐름)"):
-            st.caption("🕒 타임프레임: 4시간봉 (4H) 현물 차트 | EMA 7(파랑) · 25(노랑) · 99(빨강) | 두 손가락 확대·축소 가능")
+        disp_df = p["df_4h"].tail(360)
+        days_span = round(len(disp_df) / 6)
+        with st.expander(f"🕯️ {p['raw_symbol']} · 4시간봉(4H) 실시간 차트 + 보조지표 ({days_span}일치)"):
             chart_lines = [
                 {"price": p["price"], "color": "#FFFFFF", "width": 1, "style": 0, "title": "진입가"},
                 {"price": p["sl"], "color": "#FF4B4B", "width": 2, "style": 2, "title": "손절가"},
@@ -1286,13 +1461,15 @@ def live_recommendations_section():
                 {"price": p["fib_618"], "color": "#FFA657", "width": 1, "style": 2, "title": "Fib 0.618"},
                 {"price": p["fib_382"], "color": "#58A6FF", "width": 1, "style": 3, "title": "Fib 0.382"}
             ]
-            render_tv_candle_chart(
-                p["df_4h"].tail(220),
+            render_tv_pro_chart(
+                disp_df,
                 f"tv_pick_{idx}",
-                watermark_text=f"{p['raw_symbol']} · 4H 현물",
+                watermark_text=f"{p['raw_symbol']} · 4H ({days_span}일)",
                 price_lines=chart_lines,
-                show_ema=True,
-                height=390
+                live_symbol=p["raw_symbol"],
+                live_interval="4h",
+                show_indicators=True,
+                height=520
             )
 
 @st.fragment(run_every="60s")
@@ -1377,10 +1554,40 @@ def live_trade_journal_section():
     c2.metric("포지션 투입 증거금", f"${used_margin:,.2f}")
     c3.metric("주문 가능 잔고", f"${avail_bal:,.2f}")
 
-    # --- [영역 B] 현재 보유 중인 실시간 포지션 (1초 웹소켓) ---
+    # --- [영역 B] 현재 보유 중인 실시간 포지션 (1초 웹소켓 + 실시간 차트) ---
     st.markdown("#### 🟢 현재 보유 중인 실시간 포지션 (1초 실시간)")
     if cur_open_list:
         render_live_positions_ws(cur_open_list)
+        for p_idx, p_item in enumerate(cur_open_list):
+            p_sym = str(p_item.get("종목", "")).strip()
+            if not p_sym:
+                continue
+            entry_p = float(pd.to_numeric(p_item.get("진입가", 0), errors="coerce") or 0)
+            memo_parts = str(p_item.get("메모", "0|0")).split("|")
+            liq_p = float(memo_parts[1]) if len(memo_parts) > 1 and memo_parts[1] else 0.0
+
+            with st.expander(f"🕯️ 보유 중 · {p_sym} 4시간봉(4H) 실시간 차트 & 보조지표 보기"):
+                try:
+                    pos_df = calc_indicators(fetch_spot_klines(p_sym, "4h", 360))
+                    fib_pos = analyze_spot_swing_fib(pos_df, "4시간봉")
+                    pos_lines = [
+                        {"price": entry_p, "color": "#FFFFFF", "width": 2, "style": 0, "title": "내 진입가"},
+                        {"price": fib_pos["fib_618"], "color": "#FFA657", "width": 1, "style": 2, "title": "Fib 0.618"}
+                    ]
+                    if liq_p > 0:
+                        pos_lines.append({"price": liq_p, "color": "#FF4B4B", "width": 2, "style": 2, "title": "⚠️ 예상 청산가"})
+                    render_tv_pro_chart(
+                        pos_df,
+                        f"tv_hold_{p_idx}_{p_sym}",
+                        watermark_text=f"{p_sym} · 보유 중 (4H)",
+                        price_lines=pos_lines,
+                        live_symbol=p_sym,
+                        live_interval="4h",
+                        show_indicators=True,
+                        height=500
+                    )
+                except Exception:
+                    st.warning(f"{p_sym} 실시간 차트를 불러오는 중입니다.")
     else:
         st.caption("현재 보유 중인 선물 포지션이 없습니다. 바이낸스에서 새로 진입하면 15초 내 자동 등록됩니다.")
 
@@ -1437,20 +1644,17 @@ def live_trade_journal_section():
     st.markdown("---")
 
     # --- [영역 D] 목표 기반 복리 플래너 & 손익 상황별 대응 대책 ---
-    st.markdown("#### 🎯 복리 목표 플래너 & 상황별 대응 전략")
+    st.markdown("#### 🎯 복리 목표 플래너 & 상황별 대응 전략 (설정값 자동 저장)")
     default_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else 100.0
-    if "goal_target" not in st.session_state:
-        st.session_state["goal_target"] = round(default_seed * 2.0, 2)
-    if "goal_days" not in st.session_state:
-        st.session_state["goal_days"] = 30
+    init_and_sync_persistent_goals(default_seed)
 
     g1, g2, g3 = st.columns(3)
     start_seed = g1.number_input("시작 시드 ($)", min_value=10.0, value=default_seed, step=10.0, key="jr_seed_in")
     target_seed = g2.number_input("목표 금액 ($)", min_value=start_seed + 5.0, value=max(start_seed + 5.0, float(st.session_state["goal_target"])), step=10.0, key="jr_target_in")
     goal_days = g3.number_input("목표 기간 (일)", min_value=3, max_value=365, value=int(st.session_state["goal_days"]), step=5, key="jr_days_in")
 
-    st.session_state["goal_target"] = target_seed
-    st.session_state["goal_days"] = goal_days
+    if abs(target_seed - float(st.session_state["goal_target"])) > 0.001 or goal_days != int(st.session_state["goal_days"]):
+        save_persistent_goals(target_seed, goal_days, st.session_state.get("goal_ratio_idx", 0))
 
     growth_mult = target_seed / start_seed
     req_daily_rate = ((growth_mult ** (1.0 / goal_days)) - 1.0) * 100.0
@@ -1510,7 +1714,7 @@ def live_trade_journal_section():
 
 # ================= 9. 메인 화면 렌더링 =================
 st.markdown("### 📡 코인 선물 레이더")
-st.caption("BTC 시세와 보유 포지션은 1초마다 실시간 반영되며, 화면 깜빡임 없이 자동 갱신됩니다.")
+st.caption("BTC 시세와 보유 포지션·차트는 1초마다 실시간 반영되며, 목표 설정값도 자동 저장됩니다.")
 
 live_top_header_section()
 
@@ -1531,12 +1735,12 @@ with tab1:
     </div>""", unsafe_allow_html=True)
     st.progress(progress)
 
-    st.markdown("#### 🕯️ 비트코인 현물(Spot) 타임프레임별 피보나치 & 추세 분석")
+    st.markdown("#### 🕯️ 비트코인 현물(Spot) 타임프레임별 피보나치 & 실시간 차트")
     tf_configs = [
-        ("1M", 120, "월봉(1M) 현물", "tv_btc_1m", "BTCUSDT · 1M 월봉"),
-        ("1w", 200, "주봉(1W) 현물", "tv_btc_1w", "BTCUSDT · 1W 주봉"),
-        ("1d", 220, "일봉(1D) 현물", "tv_btc_1d", "BTCUSDT · 1D 일봉"),
-        ("4h", 250, "4시간봉(4H) 현물", "tv_btc_4h", "BTCUSDT · 4H 4시간봉")
+        ("1M", 120, "월봉(1M) 현물 · 10년치", "tv_btc_1m", "BTCUSDT · 1M 월봉 (10년)"),
+        ("1w", 160, "주봉(1W) 현물 · 3년치", "tv_btc_1w", "BTCUSDT · 1W 주봉 (3년)"),
+        ("1d", 365, "일봉(1D) 현물 · 1년치", "tv_btc_1d", "BTCUSDT · 1D 일봉 (1년)"),
+        ("4h", 360, "4시간봉(4H) 현물 · 60일치", "tv_btc_4h", "BTCUSDT · 4H 4시간봉 (60일)")
     ]
     with ThreadPoolExecutor(max_workers=4) as ex:
         tf_dfs = list(ex.map(lambda cfg: fetch_spot_klines("BTCUSDT", cfg[0], cfg[1]), tf_configs))
@@ -1547,14 +1751,15 @@ with tab1:
             try:
                 df_tf = calc_indicators(raw_df)
                 fib_res = analyze_spot_swing_fib(df_tf, label)
-                st.caption(f"🕒 타임프레임: {label} (최근 {len(df_tf)}캔들) | EMA 7(파랑) · 25(노랑) · 99(빨강)")
-                render_tv_candle_chart(
+                render_tv_pro_chart(
                     df_tf,
                     cid,
                     watermark_text=wm_txt,
                     price_lines=fib_res["chart_lines"],
-                    show_ema=True,
-                    height=380
+                    live_symbol="BTCUSDT",
+                    live_interval=interval,
+                    show_indicators=True,
+                    height=480
                 )
                 st.markdown(f'<div class="reason-box">{fib_res["html_desc"]}</div>', unsafe_allow_html=True)
             except Exception:
