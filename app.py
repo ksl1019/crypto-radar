@@ -237,6 +237,14 @@ def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_w
     ema25_data = [{"time": int(r["ts"]), "value": float(r["ema25"])} for _, r in sub.iterrows() if not np.isnan(r["ema25"])]
     ema99_data = [{"time": int(r["ts"]), "value": float(r["ema99"])} for _, r in sub.iterrows() if not np.isnan(r["ema99"])]
 
+    last_price = float(sub["close"].iloc[-1])
+    if last_price < 1:
+        prec, min_move = 4, 0.0001
+    elif last_price < 50:
+        prec, min_move = 3, 0.001
+    else:
+        prec, min_move = 2, 0.01
+
     markers = []
     if show_waves and len(sub) >= 24:
         step = max(6, len(sub) // 7)
@@ -256,11 +264,14 @@ def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_w
     lines_json = json.dumps(price_lines or [])
     ema_flag = "true" if show_ema else "false"
     html_code = f"""
-    <div id="{chart_id}" style="width: 100%; height: {height}px; border-radius: 10px; overflow: hidden;"></div>
+    <div id="{chart_id}" style="width: 100%; height: {height}px; background: #0D1117; border-radius: 10px; overflow: hidden;"></div>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       const container = document.getElementById('{chart_id}');
+      const initW = container.clientWidth || window.innerWidth || 560;
       const chart = LightweightCharts.createChart(container, {{
+        width: initW,
+        height: {height},
         layout: {{ background: {{ color: '#0D1117' }}, textColor: '#C9D1D9' }},
         grid: {{ vertLines: {{ color: '#1F242C' }}, horzLines: {{ color: '#1F242C' }} }},
         crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
@@ -271,18 +282,19 @@ def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_w
       }});
       const candleSeries = chart.addCandlestickSeries({{
         upColor: '#00D084', downColor: '#FF4B4B', borderVisible: false,
-        wickUpColor: '#00D084', wickDownColor: '#FF4B4B'
+        wickUpColor: '#00D084', wickDownColor: '#FF4B4B',
+        priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }}
       }});
       candleSeries.setData({json.dumps(candles)});
       const markers = {json.dumps(markers)};
       if (markers.length > 0) candleSeries.setMarkers(markers);
 
       if ({ema_flag}) {{
-        const s7 = chart.addLineSeries({{ color: '#58A6FF', lineWidth: 1, title: 'EMA7' }});
+        const s7 = chart.addLineSeries({{ color: '#58A6FF', lineWidth: 1, title: 'EMA7', priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
         s7.setData({json.dumps(ema7_data)});
-        const s25 = chart.addLineSeries({{ color: '#F2CC60', lineWidth: 1.5, title: 'EMA25' }});
+        const s25 = chart.addLineSeries({{ color: '#F2CC60', lineWidth: 1.5, title: 'EMA25', priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
         s25.setData({json.dumps(ema25_data)});
-        const s99 = chart.addLineSeries({{ color: '#FF7B72', lineWidth: 1.5, title: 'EMA99' }});
+        const s99 = chart.addLineSeries({{ color: '#FF7B72', lineWidth: 1.5, title: 'EMA99', priceFormat: {{ type: 'price', precision: {prec}, minMove: {min_move} }} }});
         s99.setData({json.dumps(ema99_data)});
       }}
 
@@ -294,6 +306,17 @@ def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_w
         }});
       }});
       chart.timeScale().fitContent();
+
+      const ro = new ResizeObserver(entries => {{
+        for (let entry of entries) {{
+          const w = entry.contentRect.width;
+          if (w > 0) {{
+            chart.resize(w, {height});
+            chart.timeScale().fitContent();
+          }}
+        }}
+      }});
+      ro.observe(container);
     </script>
     """
     components.html(html_code, height=height + 6)
@@ -302,11 +325,14 @@ def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
     sub = df.tail(90).copy().reset_index(drop=True)
     cvd_data = [{"time": int(r["ts"]), "value": float(r["cvd"])} for _, r in sub.iterrows()]
     html_code = f"""
-    <div id="{chart_id}" style="width: 100%; height: {height}px; border-radius: 10px; overflow: hidden;"></div>
+    <div id="{chart_id}" style="width: 100%; height: {height}px; background: #0D1117; border-radius: 10px; overflow: hidden;"></div>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       const container = document.getElementById('{chart_id}');
+      const initW = container.clientWidth || window.innerWidth || 560;
       const chart = LightweightCharts.createChart(container, {{
+        width: initW,
+        height: {height},
         layout: {{ background: {{ color: '#0D1117' }}, textColor: '#C9D1D9' }},
         grid: {{ vertLines: {{ color: '#1F242C' }}, horzLines: {{ color: '#1F242C' }} }},
         rightPriceScale: {{ borderColor: '#30363D' }},
@@ -319,6 +345,17 @@ def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
       }});
       areaSeries.setData({json.dumps(cvd_data)});
       chart.timeScale().fitContent();
+
+      const ro = new ResizeObserver(entries => {{
+        for (let entry of entries) {{
+          const w = entry.contentRect.width;
+          if (w > 0) {{
+            chart.resize(w, {height});
+            chart.timeScale().fitContent();
+          }}
+        }}
+      }});
+      ro.observe(container);
     </script>
     """
     components.html(html_code, height=height + 6)
