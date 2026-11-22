@@ -75,14 +75,96 @@ def safe_get_json(url, headers=None, timeout=4):
     except Exception:
         return None
 
+def format_kst_datetime(val):
+    s = str(val).strip()
+    if not s:
+        return ""
+    try:
+        # 2026-11-22T11:51:00.000Z 또는 ISO 문자열 파싱 후 KST(+9h) 변환
+        norm = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return s
+
 def parse_ymd(val_str):
-    nums = re.findall(r"\d+", str(val_str))
+    kst_str = format_kst_datetime(val_str)
+    nums = re.findall(r"\d+", kst_str)
     if len(nums) >= 3:
         y, m, d = int(nums[0]), int(nums[1]), int(nums[2])
         if y < 100:
             y += 2000
         return y, m, d
     return None
+
+def consolidate_closed_trades(df_raw):
+    """같은 종목·같은 포지션·같은 분(또는 2분 이내) 분할 청산 조각을 실제 1건으로 병합"""
+    if df_raw.empty:
+        return df_raw
+
+    rows_sorted = df_raw.copy()
+    rows_sorted["_kst_str"] = [format_kst_datetime(v) for v in rows_sorted["일시"]]
+    rows_sorted["_dt_parsed"] = pd.to_datetime(rows_sorted["_kst_str"], errors="coerce")
+    rows_sorted = rows_sorted.sort_values("_dt_parsed").reset_index(drop=True)
+
+    merged = []
+    for _, r in rows_sorted.iterrows():
+        sym = str(r["종목"]).strip()
+        pos = str(r["포지션"]).strip()
+        dt_p = r["_dt_parsed"]
+        pnl = float(r["수익금"])
+        margin = float(r["증거금"])
+        lev = float(r["레버리지"] or 1)
+        entry_p = float(r["진입가"] or 0)
+        exit_p = float(r["종료가"] or 0)
+        roi_val = float(r["수익률"] or 0)
+        memo_str = str(r["메모"] or "")
+
+        matched = False
+        if merged and pd.notna(dt_p):
+            prev = merged[-1]
+            prev_dt = prev["_dt_parsed"]
+            same_key = (prev["종목"] == sym and prev["포지션"] == pos)
+            close_time = pd.notna(prev_dt) and abs((dt_p - prev_dt).total_seconds()) <= 120
+            if same_key and close_time:
+                prev["수익금"] = round(prev["수익금"] + pnl, 4)
+                prev["증거금"] = round(max(prev["증거금"], margin), 2)
+                if exit_p > 0:
+                    prev["종료가"] = exit_p
+                prev["_merged_cnt"] += 1
+                denom = prev["증거금"] if prev["증거금"] > 0 else (margin if margin > 0 else 1.0)
+                prev["수익률"] = round((prev["수익금"] / denom) * 100.0, 2)
+                if "(분할" not in prev["메모"]:
+                    prev["메모"] = f"{prev['메모']} (분할 {prev['_merged_cnt']}건 합산)".strip(" |")
+                else:
+                    prev["메모"] = re.sub(r"\(분할 \d+건 합산\)", f"(분할 {prev['_merged_cnt']}건 합산)", prev["메모"])
+                matched = True
+
+        if not matched:
+            merged.append({
+                "일시": r["_kst_str"],
+                "종목": sym,
+                "포지션": pos,
+                "증거금": round(margin, 2),
+                "레버리지": int(lev) if lev.is_integer() else round(lev, 1),
+                "진입가": entry_p,
+                "종료가": exit_p,
+                "수익금": round(pnl, 4),
+                "수익률": round(roi_val, 2),
+                "근거태그": r["근거태그"],
+                "메모": memo_str,
+                "_ymd": parse_ymd(r["_kst_str"]),
+                "_date_str": r["_kst_str"][:10] if len(r["_kst_str"]) >= 10 else str(r["일시"])[:10],
+                "_dt_parsed": dt_p,
+                "_merged_cnt": 1
+            })
+
+    res_df = pd.DataFrame(merged)
+    if not res_df.empty:
+        res_df = res_df.drop(columns=["_dt_parsed", "_merged_cnt"], errors="ignore")
+    return res_df
 
 # ================= 1. 구글 시트 계좌 · 보유종목 · 목표설정 영구 저장 로더 =================
 @st.cache_data(ttl=25)
@@ -116,7 +198,6 @@ def load_sheet_state():
             tag_col = df_all["근거태그"].astype(str)
             memo_col = df_all["메모"].astype(str)
 
-            # 0) 구글 시트에 영구 저장된 마지막 목표 설정값 복원
             goal_mask = tag_col.str.startswith("GOAL_CONFIG") | (df_all["종목"] == "GOAL_CFG")
             df_goal = df_all[goal_mask]
             if not df_goal.empty:
@@ -131,7 +212,6 @@ def load_sheet_state():
                         "ratio_idx": min(2, max(0, g_ratio_idx))
                     }
 
-            # 1) 총 증거금(지갑 잔고) 스냅샷
             bal_mask = tag_col.str.startswith("BAL_SNAPSHOT|")
             df_bal = df_all[bal_mask]
             if not df_bal.empty:
@@ -140,7 +220,6 @@ def load_sheet_state():
                 state["avail_bal"] = float(pd.to_numeric(last_b["진입가"], errors="coerce") or 0)
                 state["used_margin"] = float(pd.to_numeric(last_b["종료가"], errors="coerce") or 0)
 
-            # 2) 현재 보유 포지션 스냅샷
             open_mask = tag_col.str.startswith("OPEN_SNAPSHOT|") | memo_col.str.startswith("OPEN_SNAPSHOT|")
             df_open = df_all[tag_col.str.startswith("OPEN_SNAPSHOT|")].copy()
             if not df_open.empty:
@@ -148,15 +227,12 @@ def load_sheet_state():
                 cur_open = df_open[(df_open["근거태그"] == latest_batch) & (df_open["종목"] != "NONE")]
                 state["open_list"] = cur_open.to_dict("records")
 
-            # 3) 실제 종료된 매매 기록
             exclude_mask = goal_mask | bal_mask | open_mask | (df_all["종목"].isin(["WALLET", "NONE", "GOAL_CFG"]))
             df_closed = df_all[~exclude_mask].copy()
             if not df_closed.empty:
                 for num_c in ["증거금", "레버리지", "진입가", "종료가", "수익금", "수익률"]:
                     df_closed[num_c] = pd.to_numeric(df_closed[num_c], errors="coerce").fillna(0)
-                ymd_list = [parse_ymd(v) for v in df_closed["일시"]]
-                df_closed["_ymd"] = ymd_list
-                df_closed["_date_str"] = [f"{x[0]:04d}-{x[1]:02d}-{x[2]:02d}" if x else str(raw)[:10] for x, raw in zip(ymd_list, df_closed["일시"])]
+                df_closed = consolidate_closed_trades(df_closed)
             state["df_closed"] = df_closed
     except Exception as e:
         state["error"] = str(e)
@@ -183,17 +259,26 @@ def save_goal_to_sheet(target_val, days_val, ratio_idx):
     except Exception:
         pass
 
-# ================= 2. 병렬 시장 요약 & 매크로 데이터 수집 =================
-@st.cache_data(ttl=120)
+# ================= 2. 병렬 시장 요약 · 매크로 · 수급/온체인/김프 데이터 수집 =================
+@st.cache_data(ttl=90)
 def get_market_overview():
     urls = {
         "btc": "https://data-api.binance.vision/api/v3/ticker/24hr?symbol=BTCUSDT",
+        "eth": "https://data-api.binance.vision/api/v3/ticker/24hr?symbol=ETHUSDT",
         "fund": "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
+        "oi": "https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP",
+        "ls": "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=BTC&period=4H",
         "fng": "https://api.alternative.me/fng/",
-        "dom": "https://api.coingecko.com/api/v3/global"
+        "dom": "https://api.coingecko.com/api/v3/global",
+        "upbit": "https://api.upbit.com/v1/ticker?markets=KRW-BTC",
+        "fx": "https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?interval=1d&range=2d"
     }
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {k: ex.submit(safe_get_json, u) for k, u in urls.items()}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    with ThreadPoolExecutor(max_workers=9) as ex:
+        futures = {
+            k: ex.submit(safe_get_json, u, headers if k in ["fx", "upbit"] else None)
+            for k, u in urls.items()
+        }
         res = {k: f.result() for k, f in futures.items()}
 
     btc_price_num, btc_chg_num = 0.0, 0.0
@@ -201,30 +286,67 @@ def get_market_overview():
         btc_price_num = float(res["btc"]["lastPrice"])
         btc_chg_num = float(res["btc"]["priceChangePercent"])
 
+    eth_chg_num = 0.0
+    if res["eth"] and "priceChangePercent" in res["eth"]:
+        eth_chg_num = float(res["eth"]["priceChangePercent"])
+
     funding_rate, funding_num = "N/A", 0.0
     if res["fund"] and res["fund"].get("data"):
         funding_num = float(res["fund"]["data"][0]["fundingRate"]) * 100
         funding_rate = f"{funding_num:.4f}%"
+
+    oi_btc = 0.0
+    if res["oi"] and res["oi"].get("data"):
+        oi_btc = float(res["oi"]["data"][0].get("oiCcy") or 0)
+
+    ls_ratio = 1.0
+    if res["ls"] and res["ls"].get("data") and len(res["ls"]["data"]) > 0:
+        try:
+            ls_ratio = float(res["ls"]["data"][0][1])
+        except Exception:
+            ls_ratio = 1.0
 
     fng_val, fng_class = 50, "N/A"
     if res["fng"] and res["fng"].get("data"):
         fng_val = int(res["fng"]["data"][0]["value"])
         fng_class = res["fng"]["data"][0]["value_classification"]
 
-    btc_dom = "N/A"
+    btc_dom_num, btc_dom = 0.0, "N/A"
     if res["dom"] and res["dom"].get("data"):
-        btc_dom = f"{res['dom']['data']['market_cap_percentage']['btc']:.1f}%"
+        btc_dom_num = float(res["dom"]["data"]["market_cap_percentage"]["btc"])
+        btc_dom = f"{btc_dom_num:.1f}%"
+
+    # 김치프리미엄 계산 (업비트 KRW-BTC vs 바이낸스 BTCUSDT * 환율)
+    kimchi_pct = None
+    upbit_krw = 0.0
+    fx_rate = 0.0
+    try:
+        if res["upbit"] and isinstance(res["upbit"], list) and len(res["upbit"]) > 0:
+            upbit_krw = float(res["upbit"][0]["trade_price"])
+        if res["fx"] and res["fx"].get("chart", {}).get("result"):
+            fx_rate = float(res["fx"]["chart"]["result"][0]["meta"]["regularMarketPrice"])
+        if upbit_krw > 0 and fx_rate > 0 and btc_price_num > 0:
+            global_krw = btc_price_num * fx_rate
+            kimchi_pct = ((upbit_krw - global_krw) / global_krw) * 100.0
+    except Exception:
+        kimchi_pct = None
 
     return {
-        "fng_val": fng_val, "fng_class": fng_class, "btc_dom": btc_dom,
+        "fng_val": fng_val, "fng_class": fng_class,
+        "btc_dom": btc_dom, "btc_dom_num": btc_dom_num,
         "btc_price_num": btc_price_num, "btc_chg_num": btc_chg_num,
-        "funding_rate": funding_rate, "funding_num": funding_num
+        "eth_chg_num": eth_chg_num,
+        "funding_rate": funding_rate, "funding_num": funding_num,
+        "oi_btc": oi_btc, "ls_ratio": ls_ratio,
+        "kimchi_pct": kimchi_pct, "upbit_krw": upbit_krw, "fx_rate": fx_rate
     }
 
 def render_realtime_top_board(ov):
     init_price = f"${ov['btc_price_num']:,.1f}" if ov["btc_price_num"] > 0 else "연결 중..."
     init_chg = f"{ov['btc_chg_num']:+.2f}%"
     init_col = "#00D084" if ov["btc_chg_num"] >= 0 else "#FF4B4B"
+    kimp_txt = f"{ov['kimchi_pct']:+.2f}%" if ov["kimchi_pct"] is not None else "N/A"
+    kimp_col = "#00D084" if (ov["kimchi_pct"] is not None and ov["kimchi_pct"] >= 0) else "#FF7B72"
 
     html = f"""
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-family:sans-serif;">
@@ -237,15 +359,15 @@ def render_realtime_top_board(ov):
           <span id="btc-live-price" style="font-size:18px; font-weight:bold; color:#F0F6FC;">{init_price}</span>
           <span id="btc-live-chg" style="font-size:12px; font-weight:bold; color:{init_col}; margin-left:4px;">({init_chg})</span>
         </div>
-        <div style="font-size:12px; color:#58A6FF; margin-top:4px;">선물 펀딩비: {ov['funding_rate']}</div>
+        <div style="font-size:12px; color:#58A6FF; margin-top:4px;">펀딩비: {ov['funding_rate']} · 김프: <span style="color:{kimp_col};">{kimp_txt}</span></div>
       </div>
 
       <div style="background:#161B22; border:1px solid #30363D; border-radius:12px; padding:12px 14px;">
-        <div style="font-size:12px; color:#8B949E;">공포·탐욕(일일) / 도미넌스</div>
+        <div style="font-size:12px; color:#8B949E;">공포·탐욕 / 도미넌스</div>
         <div style="font-size:18px; font-weight:bold; color:#F0F6FC; margin-top:4px;">
           {ov['fng_val']} <span style="font-size:12px; font-weight:normal; color:#C9D1D9;">({ov['fng_class']})</span>
         </div>
-        <div style="font-size:12px; color:#D2A8FF; margin-top:4px;">도미넌스: {ov['btc_dom']}</div>
+        <div style="font-size:12px; color:#D2A8FF; margin-top:4px;">BTC 점유율: {ov['btc_dom']} · 롱숏비: {ov['ls_ratio']:.2f}</div>
       </div>
     </div>
     <script>
@@ -360,6 +482,83 @@ def get_spot_orderbook_heatmap(symbol="BTCUSDT"):
     top_ask_price = float(ask_grp.loc[ask_grp["notional"].idxmax(), "bin"])
     top_ask_vol = float(ask_grp["notional"].max())
     return combined, top_bid_price, top_bid_vol, top_ask_price, top_ask_vol
+
+def build_btc_flow_and_onchain_brief(ov, btc_1d_df):
+    """주식 외인·기관 수급 대응 비트코인 기관/고래/파생/보유자·실현손익 브리핑"""
+    last_1d = btc_1d_df.iloc[-1]
+    prev_30d_avg = float(btc_1d_df["close"].tail(30).mean())
+    prev_180d_avg = float(btc_1d_df["close"].tail(180).mean())
+    cur_p = float(last_1d["close"])
+
+    # 단기 보유자(STH, ~1개월 평균 매수가 근사) vs 장기 보유자(LTH, ~6개월 평균 매수가 근사) 상태
+    sth_profit = cur_p >= prev_30d_avg
+    lth_profit = cur_p >= prev_180d_avg
+
+    if not sth_profit and lth_profit:
+        holder_status = "🟡 단기 보유자 손실 구간 · 장기 보유자 방어 중"
+        holder_detail = (
+            f"현재가(${cur_p:,.0f})가 30일 평균(${prev_30d_avg:,.0f}) 아래라 단기 매수 물량이 손실 구간에 있어 반등 시 차익·본전 매물이 나올 수 있지만, "
+            f"180일 평균(${prev_180d_avg:,.0f}) 기준 장기 물량 방어력을 체크해야 합니다."
+        )
+    elif sth_profit and lth_profit:
+        holder_status = "🟢 단기·장기 보유자 모두 수익 구간 (상승 모멘텀)"
+        holder_detail = "단기·장기 보유자 다수가 수익권에 있어 투매 압력이 약하고 추세 추종 매수세가 우호적인 구간입니다."
+    else:
+        holder_status = "🔴 단기·장기 보유자 광범위 손실 (투매/바닥 다지기 구간)"
+        holder_detail = "단기·장기 평균 매수가 아래로 내려와 손절 출회와 항복(Capitulation) 매물이 소화되는지 확인해야 하는 구간입니다."
+
+    # 선물 미결제약정 & 롱/숏 비율 & 펀딩비 조합
+    ls_r = ov["ls_ratio"]
+    if ls_r >= 1.6 and ov["funding_num"] > 0.01:
+        deriv_status = f"🔴 롱 과열 주의 (롱숏비 {ls_r:.2f} · OI {ov['oi_btc']:,.0f} BTC)"
+        deriv_detail = "개인·파생 롱 포지션이 한쪽으로 쏠려 있어 급락 시 연쇄 청산(Long Squeeze) 위험이 큽니다."
+    elif ls_r <= 0.85 and ov["funding_num"] < 0:
+        deriv_status = f"🟢 숏 쏠림·스퀴즈 여력 (롱숏비 {ls_r:.2f} · OI {ov['oi_btc']:,.0f} BTC)"
+        deriv_detail = "숏 포지션이 우세하고 펀딩비가 음수(-)라 가격 반등 시 숏 물량 청산에 따른 급등 스퀴즈가 나올 수 있습니다."
+    else:
+        deriv_status = f"⚪ 파생 수급 균형 (롱숏비 {ls_r:.2f} · OI {ov['oi_btc']:,.0f} BTC)"
+        deriv_detail = "롱·숏 비율이 과열 극단치를 벗어나 있어 현물 추세와 거래소 유입·유출 방향을 함께 봐야 합니다."
+
+    # 김치프리미엄 & BTC 도미넌스 & ETH 상대 강도
+    kimp = ov["kimchi_pct"]
+    if kimp is not None:
+        if kimp >= 3.0:
+            kimp_line = f"🇰🇷 <b>김치프리미엄 {kimp:+.2f}% (국내 과열 경계):</b> 업비트(${ov['upbit_krw']:,.0f}원 / 환율 ₩{ov['fx_rate']:,.1f}) 기준 국내 매수 열기가 높아 단기 역프 회귀에 주의하세요."
+        elif kimp <= -0.5:
+            kimp_line = f"🇰🇷 <b>김치프리미엄 {kimp:+.2f}% (역프리미엄·국내 관망):</b> 해외 대비 국내 프리미엄이 낮아 국내 개인 추격 매수가 약한 상태입니다."
+        else:
+            kimp_line = f"🇰🇷 <b>김치프리미엄 {kimp:+.2f}% (정상 범위):</b> 국내외 가격 괴리가 크지 않아 글로벌 시세 흐름을 그대로 따라가고 있습니다."
+    else:
+        kimp_line = "🇰🇷 <b>김치프리미엄:</b> 업비트/환율 시세를 실시간 불러오는 중입니다."
+
+    eth_vs_btc = ov["eth_chg_num"] - ov["btc_chg_num"]
+    dom_line = (
+        f"👑 <b>도미넌스({ov['btc_dom']}) & 알트 순환매:</b> 24h 등락률 BTC {ov['btc_chg_num']:+.2f}% vs ETH {ov['eth_chg_num']:+.2f}% "
+        f"(상대강도 {eth_vs_btc:+.2f}%) — "
+        + ("비트코인 비중 집중 장세로 알트코인 변동성 확대에 주의하세요." if ov["btc_dom_num"] >= 55 else "자금이 메이저·알트 쪽으로도 일부 순환하는 구간입니다.")
+    )
+
+    # 기관(현물 ETF) · 거래소 입출금/고래 · 실현손익(SOPR/Realized P&L) 체크 포인트
+    etf_line = (
+        f"🏦 <b>기관·ETF & 거래소/고래 수급 체크:</b> 공포·탐욕 <b>{ov['fng_val']}({ov['fng_class']})</b> · "
+        f"펀딩비 <b>{ov['funding_rate']}</b>. 미국 현물 ETF 순유입/순유출 방향과 거래소 입금(매도 압력) vs 출금(매집) 흐름, "
+        f"그리고 온체인 <b>실현 손익(Realized P/L·SOPR)</b>이 손실 확정(1 미만)인지 익절 확정(1 초과)인지 함께 확인하세요."
+    )
+
+    return f"""
+    <div class="metric-card">
+        <div style="font-weight:bold; color:#F0F6FC; margin-bottom:6px;">🏦 비트코인 기관·고래·파생·온체인 수급 브리핑 (실시간)</div>
+        <div class="reason-box" style="margin-top:4px;">
+            <div><b>{deriv_status}</b><br><span style="font-size:0.8rem; color:#8B949E;">{deriv_detail}</span></div>
+            <hr style="border-color:#21262D; margin:8px 0;">
+            <div><b>{holder_status}</b><br><span style="font-size:0.8rem; color:#8B949E;">{holder_detail}</span></div>
+            <hr style="border-color:#21262D; margin:8px 0;">
+            <div style="margin-bottom:5px;">{kimp_line}</div>
+            <div style="margin-bottom:5px;">{dom_line}</div>
+            <div>{etf_line}</div>
+        </div>
+    </div>
+    """
 
 # ================= 3. 현물 스윙 고·저점 기반 피보나치 & 추세 정밀 분석 =================
 def fmt_p(val):
@@ -499,7 +698,6 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
         for _, r in sub.iterrows() if not np.isnan(r["hist"])
     ]
 
-    # JS에서 1초마다 RSI(14)와 MACD(12,26,9), EMA(7,25,99)를 즉시 재계산할 수 있도록 직전 14개 종가 및 직전 EMA 상태 전달
     closes_tail = [float(x) for x in sub["close"].tail(20).tolist()]
     prev_ema7 = float(sub["ema7"].iloc[-2]) if len(sub) >= 2 else float(sub["close"].iloc[-1])
     prev_ema25 = float(sub["ema25"].iloc[-2]) if len(sub) >= 2 else float(sub["close"].iloc[-1])
@@ -651,7 +849,6 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
         }});
       }}
 
-      // 실시간 웹소켓: 캔들 + 거래량 + EMA + RSI(14) + MACD(12,26,9) 1초마다 동시 재계산 & 갱신
       const wsSym = '{ws_sym}';
       const wsIntv = '{live_interval}';
       const histCloses = {json.dumps(closes_tail)};
@@ -688,7 +885,6 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
             const tSec = Math.floor(k.t / 1000) + (9 * 3600);
             const o = parseFloat(k.o), h = parseFloat(k.h), l = parseFloat(k.l), c = parseFloat(k.c), v = parseFloat(k.v);
 
-            // 1) 메인 캔들 & 거래량 갱신
             candleSeries.update({{ time: tSec, open: o, high: h, low: l, close: c }});
             volSeries.update({{
               time: tSec,
@@ -696,7 +892,6 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
               color: c >= o ? 'rgba(0, 208, 132, 0.45)' : 'rgba(255, 75, 75, 0.45)'
             }});
 
-            // 2) EMA 7 / 25 / 99 실시간 갱신
             const curEma7 = c * (2 / 8) + prevEma7 * (1 - 2 / 8);
             const curEma25 = c * (2 / 26) + prevEma25 * (1 - 2 / 26);
             const curEma99 = c * (2 / 100) + prevEma99 * (1 - 2 / 100);
@@ -704,7 +899,6 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
             s25.update({{ time: tSec, value: curEma25 }});
             s99.update({{ time: tSec, value: curEma99 }});
 
-            // 3) RSI(14) & MACD(12, 26, 9) 실시간 재계산 & 그래프/텍스트 동시 갱신
             if ({ind_flag}) {{
               const tempCloses = histCloses.slice(0, -1).concat([c]);
               const liveRsi = calcLiveRSI(tempCloses);
@@ -1308,7 +1502,7 @@ def diagnose_single_trade(row, wallet_bal):
     lev = int(float(row.get("레버리지", 1)))
     pnl = float(row.get("수익금", 0))
     roi = float(row.get("수익률", 0))
-    dt = str(row.get("일시", ""))
+    dt = format_kst_datetime(row.get("일시", ""))
 
     reasons = []
     if pnl < 0:
@@ -1329,7 +1523,7 @@ def diagnose_single_trade(row, wallet_bal):
         else:
             reasons.append(f"• <b>이상적 손익비(+{roi:.1f}% · {lev}배):</b> 진입 근거와 배율 조절이 안정적이었습니다. 이 패턴을 유지하세요.")
 
-    return f"<div style='margin-bottom:8px;'>{badge} <span style='font-size:0.75rem; color:#8B949E;'>({dt})</span><div style='margin-top:4px;'>{'<br>'.join(reasons)}</div></div>"
+    return f"<div style='margin-bottom:8px;'>{badge} <span style='font-size:0.75rem; color:#8B949E;'>({dt} KST)</span><div style='margin-top:4px;'>{'<br>'.join(reasons)}</div></div>"
 
 def build_overall_habit_diagnosis(df_closed):
     if df_closed.empty:
@@ -1357,7 +1551,7 @@ def build_overall_habit_diagnosis(df_closed):
     return "<br>".join(notes)
 
 # ================= 8. 실시간 자동 갱신 섹션(@st.fragment) =================
-@st.fragment(run_every="120s")
+@st.fragment(run_every="90s")
 def live_top_header_section():
     ov = get_market_overview()
     render_realtime_top_board(ov)
@@ -1470,7 +1664,7 @@ def live_recommendations_section():
             1회 진입 증거금: <b style="color:#58A6FF;">${entry_margin:,.2f}</b>
         </div>
         <div style="font-size:0.76rem; color:#8B949E; margin-top:3px;">
-            목표 설정은 구글 시트에 자동 저장되어 앱을 껐다 켜도 그대로 유지됩니다.
+            목표 설정은 구글 시트에 저장되어 껐다 켜도 유지됩니다. · <b>4시간봉(4H) 1초 실시간 차트 + 보조지표</b> 지원
         </div>
     </div>""", unsafe_allow_html=True)
 
@@ -1612,14 +1806,12 @@ def live_trade_journal_section():
     cur_open_list = acc_state["open_list"]
     df_closed = acc_state["df_closed"]
 
-    # --- [영역 A] 선물 계좌 총 증거금(시드) ---
     st.markdown("#### 💰 내 바이낸스 선물 증거금 총액")
     c1, c2, c3 = st.columns(3)
     c1.metric("총 지갑 잔고(시드)", f"${wallet_bal:,.2f}")
     c2.metric("포지션 투입 증거금", f"${used_margin:,.2f}")
     c3.metric("주문 가능 잔고", f"${avail_bal:,.2f}")
 
-    # --- [영역 B] 현재 보유 중인 실시간 포지션 (1초 웹소켓 + 실시간 차트) ---
     st.markdown("#### 🟢 현재 보유 중인 실시간 포지션 (1초 실시간)")
     if cur_open_list:
         render_live_positions_ws(cur_open_list)
@@ -1658,8 +1850,7 @@ def live_trade_journal_section():
 
     st.markdown("---")
 
-    # --- [영역 C] 월별 손익 캘린더 & 종료된 매매 기록 ---
-    st.markdown("#### 📅 월별 손익 캘린더 & 종료된 매매 기록")
+    st.markdown("#### 📅 월별 손익 캘린더 & 종료된 매매 기록 (분할 청산 1건 합산 · KST)")
     now_kst = datetime.now(KST)
     cal_c1, cal_c2 = st.columns(2)
     sel_year = cal_c1.selectbox("연도", [now_kst.year - 1, now_kst.year, now_kst.year + 1], index=1)
@@ -1691,7 +1882,6 @@ def live_trade_journal_section():
         valid_cols = [c for c in display_cols if c in view_df.columns]
         st.dataframe(view_df[valid_cols].iloc[::-1], use_container_width=True, hide_index=True)
 
-        # --- [영역 C-2] 매매 종료 자동 원인 진단 리포트 ---
         st.markdown("#### 🔍 종료 매매 자동 원인 분석 (AI 복기)")
         recent_rows = df_closed.iloc[::-1].head(4)
         diag_blocks = "".join([diagnose_single_trade(r, wallet_bal) for _, r in recent_rows.iterrows()])
@@ -1708,7 +1898,6 @@ def live_trade_journal_section():
 
     st.markdown("---")
 
-    # --- [영역 D] 목표 기반 복리 플래너 & 손익 상황별 대응 대책 ---
     st.markdown("#### 🎯 복리 목표 플래너 & 상황별 대응 전략 (구글 시트 영구 저장)")
     default_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else 100.0
     saved_g = acc_state.get("saved_goal")
@@ -1783,13 +1972,14 @@ def live_trade_journal_section():
 
 # ================= 9. 메인 화면 렌더링 =================
 st.markdown("### 📡 코인 선물 레이더")
-st.caption("BTC 시세와 보유 포지션·차트·보조지표는 1초마다 실시간 반영되며, 목표 설정은 구글 시트에 자동 저장됩니다.")
+st.caption("BTC 시세와 보유 포지션·차트·보조지표는 1초마다 실시간 반영되며, 목표 설정은 구글 시트에 저장됩니다.")
 
 live_top_header_section()
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 시장 브리핑", "🎯 추천 종목", "📅 경제 일정", "📰 경제·속보", "📝 매매일지"])
 
 with tab1:
+    ov_b = get_market_overview()
     halving_date = datetime(2024, 4, 20, tzinfo=KST)
     days_passed = (datetime.now(KST) - halving_date).days
     progress = min(days_passed / 1460, 1.0)
@@ -1813,6 +2003,12 @@ with tab1:
     ]
     with ThreadPoolExecutor(max_workers=4) as ex:
         tf_dfs = list(ex.map(lambda cfg: fetch_spot_klines("BTCUSDT", cfg[0], cfg[1]), tf_configs))
+
+    try:
+        btc_1d_calc = calc_indicators(tf_dfs[2])
+        st.markdown(build_btc_flow_and_onchain_brief(ov_b, btc_1d_calc), unsafe_allow_html=True)
+    except Exception:
+        pass
 
     tf_tabs = st.tabs(["월봉 (1M)", "주봉 (1W)", "일봉 (1D)", "4시간봉 (4H)"])
     for t_tab, (interval, lim, label, cid, wm_txt), raw_df in zip(tf_tabs, tf_configs, tf_dfs):
