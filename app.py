@@ -69,64 +69,6 @@ st.markdown("""
 
 KST = timezone(timedelta(hours=9))
 
-# ================= 영구 설정 저장(브라우저 localStorage + URL 동기화) =================
-def init_and_sync_persistent_goals(default_seed):
-    qp = st.query_params
-    if "goal_target" not in st.session_state:
-        try:
-            st.session_state["goal_target"] = float(qp.get("gt", round(default_seed * 2.0, 2)))
-        except Exception:
-            st.session_state["goal_target"] = round(default_seed * 2.0, 2)
-    if "goal_days" not in st.session_state:
-        try:
-            st.session_state["goal_days"] = int(qp.get("gd", 30))
-        except Exception:
-            st.session_state["goal_days"] = 30
-    if "goal_ratio_idx" not in st.session_state:
-        try:
-            st.session_state["goal_ratio_idx"] = int(qp.get("gr", 0))
-        except Exception:
-            st.session_state["goal_ratio_idx"] = 0
-
-    # 브라우저 localStorage 복원 (URL 파라미터가 없을 때 저장된 값 자동 주입)
-    restore_js = """
-    <script>
-      try {
-        const url = new URL(window.parent.location.href);
-        const savedGt = localStorage.getItem('cr_goal_target');
-        const savedGd = localStorage.getItem('cr_goal_days');
-        const savedGr = localStorage.getItem('cr_goal_ratio');
-        let changed = false;
-        if (!url.searchParams.has('gt') && savedGt) { url.searchParams.set('gt', savedGt); changed = true; }
-        if (!url.searchParams.has('gd') && savedGd) { url.searchParams.set('gd', savedGd); changed = true; }
-        if (!url.searchParams.has('gr') && savedGr) { url.searchParams.set('gr', savedGr); changed = true; }
-        if (changed) { window.parent.location.replace(url.toString()); }
-      } catch (e) {}
-    </script>
-    """
-    components.html(restore_js, height=0)
-
-def save_persistent_goals(gt_val, gd_val, gr_idx):
-    st.session_state["goal_target"] = float(gt_val)
-    st.session_state["goal_days"] = int(gd_val)
-    st.session_state["goal_ratio_idx"] = int(gr_idx)
-    try:
-        st.query_params["gt"] = str(round(float(gt_val), 2))
-        st.query_params["gd"] = str(int(gd_val))
-        st.query_params["gr"] = str(int(gr_idx))
-    except Exception:
-        pass
-    save_js = f"""
-    <script>
-      try {{
-        localStorage.setItem('cr_goal_target', '{round(float(gt_val), 2)}');
-        localStorage.setItem('cr_goal_days', '{int(gd_val)}');
-        localStorage.setItem('cr_goal_ratio', '{int(gr_idx)}');
-      }} catch (e) {{}}
-    </script>
-    """
-    components.html(save_js, height=0)
-
 def safe_get_json(url, headers=None, timeout=4):
     try:
         return requests.get(url, headers=headers, timeout=timeout).json()
@@ -142,7 +84,7 @@ def parse_ymd(val_str):
         return y, m, d
     return None
 
-# ================= 1. 구글 시트 계좌 · 보유종목 · 매매일지 통합 로더 =================
+# ================= 1. 구글 시트 계좌 · 보유종목 · 목표설정 영구 저장 로더 =================
 @st.cache_data(ttl=25)
 def load_sheet_state():
     sheet_url = st.secrets.get("SHEET_URL", "")
@@ -153,6 +95,7 @@ def load_sheet_state():
         "used_margin": 0.0,
         "open_list": [],
         "df_closed": pd.DataFrame(),
+        "saved_goal": None,
         "error": None
     }
     if not sheet_url:
@@ -173,6 +116,22 @@ def load_sheet_state():
             tag_col = df_all["근거태그"].astype(str)
             memo_col = df_all["메모"].astype(str)
 
+            # 0) 구글 시트에 영구 저장된 마지막 목표 설정값 복원
+            goal_mask = tag_col.str.startswith("GOAL_CONFIG") | (df_all["종목"] == "GOAL_CFG")
+            df_goal = df_all[goal_mask]
+            if not df_goal.empty:
+                last_g = df_goal.iloc[-1]
+                g_target = float(pd.to_numeric(last_g["진입가"], errors="coerce") or 0)
+                g_days = int(float(pd.to_numeric(last_g["레버리지"], errors="coerce") or 30))
+                g_ratio_idx = int(float(pd.to_numeric(last_g["수익금"], errors="coerce") or 0))
+                if g_target > 0:
+                    state["saved_goal"] = {
+                        "target": g_target,
+                        "days": max(3, g_days),
+                        "ratio_idx": min(2, max(0, g_ratio_idx))
+                    }
+
+            # 1) 총 증거금(지갑 잔고) 스냅샷
             bal_mask = tag_col.str.startswith("BAL_SNAPSHOT|")
             df_bal = df_all[bal_mask]
             if not df_bal.empty:
@@ -181,6 +140,7 @@ def load_sheet_state():
                 state["avail_bal"] = float(pd.to_numeric(last_b["진입가"], errors="coerce") or 0)
                 state["used_margin"] = float(pd.to_numeric(last_b["종료가"], errors="coerce") or 0)
 
+            # 2) 현재 보유 포지션 스냅샷
             open_mask = tag_col.str.startswith("OPEN_SNAPSHOT|") | memo_col.str.startswith("OPEN_SNAPSHOT|")
             df_open = df_all[tag_col.str.startswith("OPEN_SNAPSHOT|")].copy()
             if not df_open.empty:
@@ -188,7 +148,8 @@ def load_sheet_state():
                 cur_open = df_open[(df_open["근거태그"] == latest_batch) & (df_open["종목"] != "NONE")]
                 state["open_list"] = cur_open.to_dict("records")
 
-            exclude_mask = bal_mask | open_mask | (df_all["종목"].isin(["WALLET", "NONE"]))
+            # 3) 실제 종료된 매매 기록
+            exclude_mask = goal_mask | bal_mask | open_mask | (df_all["종목"].isin(["WALLET", "NONE", "GOAL_CFG"]))
             df_closed = df_all[~exclude_mask].copy()
             if not df_closed.empty:
                 for num_c in ["증거금", "레버리지", "진입가", "종료가", "수익금", "수익률"]:
@@ -200,6 +161,27 @@ def load_sheet_state():
     except Exception as e:
         state["error"] = str(e)
     return state
+
+def save_goal_to_sheet(target_val, days_val, ratio_idx):
+    sheet_url = st.secrets.get("SHEET_URL", "")
+    st.session_state["goal_target"] = float(target_val)
+    st.session_state["goal_days"] = int(days_val)
+    st.session_state["goal_ratio_idx"] = int(ratio_idx)
+    if not sheet_url:
+        return
+    try:
+        dt_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+        row_data = [
+            dt_str, "GOAL_CFG", "목표설정",
+            0, int(days_val),
+            round(float(target_val), 2), 0,
+            int(ratio_idx), 0,
+            "GOAL_CONFIG", "사용자목표영구저장"
+        ]
+        requests.post(sheet_url, json=row_data, timeout=6)
+        load_sheet_state.clear()
+    except Exception:
+        pass
 
 # ================= 2. 병렬 시장 요약 & 매크로 데이터 수집 =================
 @st.cache_data(ttl=120)
@@ -487,7 +469,7 @@ def analyze_spot_swing_fib(df, tf_name):
         "is_uptrend_structure": low_idx < high_idx
     }
 
-# ================= 4. 실시간 웹소켓 캔들 + 보조지표(거래량·RSI·MACD) 차트 렌더러 =================
+# ================= 4. 1초 실시간 캔들 + 보조지표(EMA·거래량·RSI·MACD) 동시 재계산 차트 =================
 def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_symbol=None, live_interval="4h", show_indicators=True, height=480):
     sub = df.copy().reset_index(drop=True)
     candles = [
@@ -517,6 +499,17 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
         for _, r in sub.iterrows() if not np.isnan(r["hist"])
     ]
 
+    # JS에서 1초마다 RSI(14)와 MACD(12,26,9), EMA(7,25,99)를 즉시 재계산할 수 있도록 직전 14개 종가 및 직전 EMA 상태 전달
+    closes_tail = [float(x) for x in sub["close"].tail(20).tolist()]
+    prev_ema7 = float(sub["ema7"].iloc[-2]) if len(sub) >= 2 else float(sub["close"].iloc[-1])
+    prev_ema25 = float(sub["ema25"].iloc[-2]) if len(sub) >= 2 else float(sub["close"].iloc[-1])
+    prev_ema99 = float(sub["ema99"].iloc[-2]) if len(sub) >= 2 else float(sub["close"].iloc[-1])
+    ema12_series = sub["close"].ewm(span=12, adjust=False).mean()
+    ema26_series = sub["close"].ewm(span=26, adjust=False).mean()
+    prev_ema12 = float(ema12_series.iloc[-2]) if len(sub) >= 2 else float(sub["close"].iloc[-1])
+    prev_ema26 = float(ema26_series.iloc[-2]) if len(sub) >= 2 else float(sub["close"].iloc[-1])
+    prev_sig = float(sub["signal"].iloc[-2]) if len(sub) >= 2 else 0.0
+
     last_price = float(sub["close"].iloc[-1])
     last_rsi = float(sub["rsi"].iloc[-1]) if not np.isnan(sub["rsi"].iloc[-1]) else 50.0
     last_macd = float(sub["macd"].iloc[-1]) if not np.isnan(sub["macd"].iloc[-1]) else 0.0
@@ -543,7 +536,7 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
         sub_panels_html = f"""
         <div style="font-size:11px; color:#8B949E; padding:4px 8px 2px 8px; background:#0D1117; border-top:1px solid #21262D; display:flex; justify-content:space-between;">
           <span>📊 RSI (14) <span style="color:#E3B341;">■</span></span>
-          <span>현재 RSI: <b id="{chart_id}_rsi_txt" style="color:#F0F6FC;">{last_rsi:.1f}</b> (과매수 70 / 과매도 30)</span>
+          <span>실시간 RSI: <b id="{chart_id}_rsi_txt" style="color:#F0F6FC;">{last_rsi:.1f}</b> (70 / 30)</span>
         </div>
         <div id="{chart_id}_rsi" style="width: 100%; height: {rsi_h}px; background: #0D1117;"></div>
         <div style="font-size:11px; color:#8B949E; padding:4px 8px 2px 8px; background:#0D1117; border-top:1px solid #21262D; display:flex; justify-content:space-between;">
@@ -556,8 +549,8 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
     html_code = f"""
     <div style="border:1px solid #30363D; border-radius:10px; overflow:hidden; background:#0D1117; font-family:sans-serif;">
       <div style="font-size:11px; color:#8B949E; padding:5px 8px; background:#161B22; display:flex; justify-content:space-between; align-items:center;">
-        <span>🕯️ 캔들 + 거래량 · <span style="color:#58A6FF;">EMA7</span> / <span style="color:#F2CC60;">EMA25</span> / <span style="color:#FF7B72;">EMA99</span></span>
-        <span style="color:#00D084; font-weight:bold;">● 1초 실시간 연동</span>
+        <span>🕯️ 캔들+거래량 · <span style="color:#58A6FF;">EMA7</span>/<span style="color:#F2CC60;">25</span>/<span style="color:#FF7B72;">99</span></span>
+        <span style="color:#00D084; font-weight:bold;">● 1초 실시간 (지표 연동)</span>
       </div>
       <div id="{chart_id}_main" style="width: 100%; height: {main_h}px; background: #0D1117;"></div>
       {sub_panels_html}
@@ -623,6 +616,7 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
       mainChart.timeScale().fitContent();
 
       let rsiChart = null, macdChart = null;
+      let rsiSeries = null, histSeries = null, macdLine = null, sigLine = null;
       if ({ind_flag}) {{
         const rsiEl = document.getElementById('{chart_id}_rsi');
         rsiChart = LightweightCharts.createChart(rsiEl, {{
@@ -630,7 +624,7 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
           height: {rsi_h},
           timeScale: {{ ...commonOpts.timeScale, visible: false }}
         }});
-        const rsiSeries = rsiChart.addLineSeries({{ color: '#E3B341', lineWidth: 1.5 }});
+        rsiSeries = rsiChart.addLineSeries({{ color: '#E3B341', lineWidth: 1.5 }});
         rsiSeries.setData({json.dumps(rsi_data)});
         rsiSeries.createPriceLine({{ price: 70, color: 'rgba(255, 75, 75, 0.5)', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' }});
         rsiSeries.createPriceLine({{ price: 30, color: 'rgba(0, 208, 132, 0.5)', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' }});
@@ -641,15 +635,14 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
           ...commonOpts,
           height: {macd_h}
         }});
-        const histSeries = macdChart.addHistogramSeries({{}});
+        histSeries = macdChart.addHistogramSeries({{}});
         histSeries.setData({json.dumps(hist_data)});
-        const macdLine = macdChart.addLineSeries({{ color: '#58A6FF', lineWidth: 1.3 }});
+        macdLine = macdChart.addLineSeries({{ color: '#58A6FF', lineWidth: 1.3 }});
         macdLine.setData({json.dumps(macd_data)});
-        const sigLine = macdChart.addLineSeries({{ color: '#FFA657', lineWidth: 1.3 }});
+        sigLine = macdChart.addLineSeries({{ color: '#FFA657', lineWidth: 1.3 }});
         sigLine.setData({json.dumps(sig_data)});
         macdChart.timeScale().fitContent();
 
-        // 메인 차트와 보조지표 타임스케일 좌우 스크롤·줌 동기화
         mainChart.timeScale().subscribeVisibleLogicalRangeChange(range => {{
           if (range) {{
             rsiChart.timeScale().setVisibleLogicalRange(range);
@@ -658,9 +651,33 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
         }});
       }}
 
-      // 바이낸스 실시간 캔들 웹소켓 연결 (마지막 캔들 1초 단위 실시간 갱신)
+      // 실시간 웹소켓: 캔들 + 거래량 + EMA + RSI(14) + MACD(12,26,9) 1초마다 동시 재계산 & 갱신
       const wsSym = '{ws_sym}';
       const wsIntv = '{live_interval}';
+      const histCloses = {json.dumps(closes_tail)};
+      const prevEma7 = {prev_ema7};
+      const prevEma25 = {prev_ema25};
+      const prevEma99 = {prev_ema99};
+      const prevEma12 = {prev_ema12};
+      const prevEma26 = {prev_ema26};
+      const prevSig = {prev_sig};
+
+      function calcLiveRSI(closesArr) {{
+        if (closesArr.length < 15) return 50.0;
+        const recent = closesArr.slice(-15);
+        let gainSum = 0, lossSum = 0;
+        for (let i = 1; i < recent.length; i++) {{
+          const diff = recent[i] - recent[i - 1];
+          if (diff > 0) gainSum += diff;
+          else lossSum -= diff;
+        }}
+        const avgGain = gainSum / 14.0;
+        const avgLoss = lossSum / 14.0;
+        if (avgLoss === 0) return 100.0;
+        const rs = avgGain / avgLoss;
+        return 100.0 - (100.0 / (1.0 + rs));
+      }}
+
       if (wsSym) {{
         function connectKlineWS() {{
           const ws = new WebSocket('wss://stream.binance.com:9443/ws/' + wsSym + '@kline_' + wsIntv);
@@ -670,12 +687,54 @@ def render_tv_pro_chart(df, chart_id, watermark_text="", price_lines=None, live_
             const k = msg.k;
             const tSec = Math.floor(k.t / 1000) + (9 * 3600);
             const o = parseFloat(k.o), h = parseFloat(k.h), l = parseFloat(k.l), c = parseFloat(k.c), v = parseFloat(k.v);
+
+            // 1) 메인 캔들 & 거래량 갱신
             candleSeries.update({{ time: tSec, open: o, high: h, low: l, close: c }});
             volSeries.update({{
               time: tSec,
               value: v,
               color: c >= o ? 'rgba(0, 208, 132, 0.45)' : 'rgba(255, 75, 75, 0.45)'
             }});
+
+            // 2) EMA 7 / 25 / 99 실시간 갱신
+            const curEma7 = c * (2 / 8) + prevEma7 * (1 - 2 / 8);
+            const curEma25 = c * (2 / 26) + prevEma25 * (1 - 2 / 26);
+            const curEma99 = c * (2 / 100) + prevEma99 * (1 - 2 / 100);
+            s7.update({{ time: tSec, value: curEma7 }});
+            s25.update({{ time: tSec, value: curEma25 }});
+            s99.update({{ time: tSec, value: curEma99 }});
+
+            // 3) RSI(14) & MACD(12, 26, 9) 실시간 재계산 & 그래프/텍스트 동시 갱신
+            if ({ind_flag}) {{
+              const tempCloses = histCloses.slice(0, -1).concat([c]);
+              const liveRsi = calcLiveRSI(tempCloses);
+              if (rsiSeries) rsiSeries.update({{ time: tSec, value: liveRsi }});
+              const rsiTxtEl = document.getElementById('{chart_id}_rsi_txt');
+              if (rsiTxtEl) {{
+                rsiTxtEl.textContent = liveRsi.toFixed(1);
+                rsiTxtEl.style.color = liveRsi >= 70 ? '#FF4B4B' : (liveRsi <= 30 ? '#00D084' : '#F0F6FC');
+              }}
+
+              const curEma12 = c * (2 / 13) + prevEma12 * (1 - 2 / 13);
+              const curEma26 = c * (2 / 27) + prevEma26 * (1 - 2 / 27);
+              const curMacd = curEma12 - curEma26;
+              const curSig = curMacd * (2 / 10) + prevSig * (1 - 2 / 10);
+              const curHist = curMacd - curSig;
+
+              if (macdLine) macdLine.update({{ time: tSec, value: curMacd }});
+              if (sigLine) sigLine.update({{ time: tSec, value: curSig }});
+              if (histSeries) {{
+                histSeries.update({{
+                  time: tSec,
+                  value: curHist,
+                  color: curHist >= 0 ? 'rgba(0, 208, 132, 0.65)' : 'rgba(255, 75, 75, 0.65)'
+                }});
+              }}
+              const macdTxtEl = document.getElementById('{chart_id}_macd_txt');
+              if (macdTxtEl) {{
+                macdTxtEl.textContent = curMacd.toFixed(4) + ' / ' + curSig.toFixed(4);
+              }}
+            }}
           }};
           ws.onclose = () => setTimeout(connectKlineWS, 3000);
         }}
@@ -1367,9 +1426,15 @@ def live_recommendations_section():
     avail_bal = acc_state["avail_bal"]
     base_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else (max(10.0, round(avail_bal, 2)) if avail_bal > 0 else 100.0)
 
-    init_and_sync_persistent_goals(base_seed)
+    saved_g = acc_state.get("saved_goal")
+    if "goal_target" not in st.session_state:
+        st.session_state["goal_target"] = saved_g["target"] if saved_g else round(base_seed * 2.0, 2)
+    if "goal_days" not in st.session_state:
+        st.session_state["goal_days"] = saved_g["days"] if saved_g else 30
+    if "goal_ratio_idx" not in st.session_state:
+        st.session_state["goal_ratio_idx"] = saved_g["ratio_idx"] if saved_g else 0
 
-    st.markdown("#### 🎯 내 시드 · 복리 목표 연동 자동 세팅 (설정값 자동 저장)")
+    st.markdown("#### 🎯 내 시드 · 복리 목표 연동 자동 세팅 (구글 시트 영구 저장)")
     g1, g2, g3 = st.columns(3)
     cur_seed_disp = g1.number_input("현재 총 시드 ($)", min_value=10.0, value=base_seed, step=10.0, key="rec_seed_in")
     target_goal = g2.number_input("목표 금액 ($)", min_value=cur_seed_disp + 5.0, value=max(cur_seed_disp + 5.0, float(st.session_state["goal_target"])), step=10.0, key="rec_target_in")
@@ -1385,7 +1450,7 @@ def live_recommendations_section():
         or target_days != int(st.session_state["goal_days"])
         or cur_r_idx != int(st.session_state["goal_ratio_idx"])
     ):
-        save_persistent_goals(target_goal, target_days, cur_r_idx)
+        save_goal_to_sheet(target_goal, target_days, cur_r_idx)
 
     growth_mult = target_goal / cur_seed_disp
     req_daily_pct = ((growth_mult ** (1.0 / target_days)) - 1.0) * 100.0
@@ -1405,7 +1470,7 @@ def live_recommendations_section():
             1회 진입 증거금: <b style="color:#58A6FF;">${entry_margin:,.2f}</b>
         </div>
         <div style="font-size:0.76rem; color:#8B949E; margin-top:3px;">
-            목표 금액·기간·비중은 앱을 껐다 켜도 유지됩니다. · <b>4시간봉(4H) 실시간 차트 + 거래량·RSI·MACD</b> 지원
+            목표 설정은 구글 시트에 자동 저장되어 앱을 껐다 켜도 그대로 유지됩니다.
         </div>
     </div>""", unsafe_allow_html=True)
 
@@ -1453,7 +1518,7 @@ def live_recommendations_section():
 
         disp_df = p["df_4h"].tail(360)
         days_span = round(len(disp_df) / 6)
-        with st.expander(f"🕯️ {p['raw_symbol']} · 4시간봉(4H) 실시간 차트 + 보조지표 ({days_span}일치)"):
+        with st.expander(f"🕯️ {p['raw_symbol']} · 4시간봉(4H) 1초 실시간 차트 + 보조지표 ({days_span}일치)"):
             chart_lines = [
                 {"price": p["price"], "color": "#FFFFFF", "width": 1, "style": 0, "title": "진입가"},
                 {"price": p["sl"], "color": "#FF4B4B", "width": 2, "style": 2, "title": "손절가"},
@@ -1566,7 +1631,7 @@ def live_trade_journal_section():
             memo_parts = str(p_item.get("메모", "0|0")).split("|")
             liq_p = float(memo_parts[1]) if len(memo_parts) > 1 and memo_parts[1] else 0.0
 
-            with st.expander(f"🕯️ 보유 중 · {p_sym} 4시간봉(4H) 실시간 차트 & 보조지표 보기"):
+            with st.expander(f"🕯️ 보유 중 · {p_sym} 4시간봉(4H) 1초 실시간 차트 & 보조지표 보기"):
                 try:
                     pos_df = calc_indicators(fetch_spot_klines(p_sym, "4h", 360))
                     fib_pos = analyze_spot_swing_fib(pos_df, "4시간봉")
@@ -1644,9 +1709,13 @@ def live_trade_journal_section():
     st.markdown("---")
 
     # --- [영역 D] 목표 기반 복리 플래너 & 손익 상황별 대응 대책 ---
-    st.markdown("#### 🎯 복리 목표 플래너 & 상황별 대응 전략 (설정값 자동 저장)")
+    st.markdown("#### 🎯 복리 목표 플래너 & 상황별 대응 전략 (구글 시트 영구 저장)")
     default_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else 100.0
-    init_and_sync_persistent_goals(default_seed)
+    saved_g = acc_state.get("saved_goal")
+    if "goal_target" not in st.session_state:
+        st.session_state["goal_target"] = saved_g["target"] if saved_g else round(default_seed * 2.0, 2)
+    if "goal_days" not in st.session_state:
+        st.session_state["goal_days"] = saved_g["days"] if saved_g else 30
 
     g1, g2, g3 = st.columns(3)
     start_seed = g1.number_input("시작 시드 ($)", min_value=10.0, value=default_seed, step=10.0, key="jr_seed_in")
@@ -1654,7 +1723,7 @@ def live_trade_journal_section():
     goal_days = g3.number_input("목표 기간 (일)", min_value=3, max_value=365, value=int(st.session_state["goal_days"]), step=5, key="jr_days_in")
 
     if abs(target_seed - float(st.session_state["goal_target"])) > 0.001 or goal_days != int(st.session_state["goal_days"]):
-        save_persistent_goals(target_seed, goal_days, st.session_state.get("goal_ratio_idx", 0))
+        save_goal_to_sheet(target_seed, goal_days, st.session_state.get("goal_ratio_idx", 0))
 
     growth_mult = target_seed / start_seed
     req_daily_rate = ((growth_mult ** (1.0 / goal_days)) - 1.0) * 100.0
@@ -1714,7 +1783,7 @@ def live_trade_journal_section():
 
 # ================= 9. 메인 화면 렌더링 =================
 st.markdown("### 📡 코인 선물 레이더")
-st.caption("BTC 시세와 보유 포지션·차트는 1초마다 실시간 반영되며, 목표 설정값도 자동 저장됩니다.")
+st.caption("BTC 시세와 보유 포지션·차트·보조지표는 1초마다 실시간 반영되며, 목표 설정은 구글 시트에 자동 저장됩니다.")
 
 live_top_header_section()
 
@@ -1735,7 +1804,7 @@ with tab1:
     </div>""", unsafe_allow_html=True)
     st.progress(progress)
 
-    st.markdown("#### 🕯️ 비트코인 현물(Spot) 타임프레임별 피보나치 & 실시간 차트")
+    st.markdown("#### 🕯️ 비트코인 현물(Spot) 타임프레임별 피보나치 & 1초 실시간 차트")
     tf_configs = [
         ("1M", 120, "월봉(1M) 현물 · 10년치", "tv_btc_1m", "BTCUSDT · 1M 월봉 (10년)"),
         ("1w", 160, "주봉(1W) 현물 · 3년치", "tv_btc_1w", "BTCUSDT · 1W 주봉 (3년)"),
