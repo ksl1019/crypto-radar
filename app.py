@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import json
 import re
+import math
 import calendar
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -56,8 +57,8 @@ st.markdown("""
     }
     .lev-box {
         background-color: rgba(88, 166, 255, 0.1); border: 1px solid rgba(88, 166, 255, 0.3);
-        border-radius: 8px; padding: 8px 10px; margin-top: 8px;
-        font-size: 0.83rem; color: #79C0FF;
+        border-radius: 8px; padding: 9px 11px; margin-top: 8px;
+        font-size: 0.83rem; line-height: 1.52; color: #79C0FF;
     }
     .news-card {
         background-color: #161B22; border: 1px solid #30363D;
@@ -135,8 +136,8 @@ def load_sheet_state():
             exclude_mask = bal_mask | open_mask | (df_all["종목"].isin(["WALLET", "NONE"]))
             df_closed = df_all[~exclude_mask].copy()
             if not df_closed.empty:
-                df_closed["수익금"] = pd.to_numeric(df_closed["수익금"], errors="coerce").fillna(0)
-                df_closed["수익률"] = pd.to_numeric(df_closed["수익률"], errors="coerce").fillna(0)
+                for num_c in ["증거금", "레버리지", "진입가", "종료가", "수익금", "수익률"]:
+                    df_closed[num_c] = pd.to_numeric(df_closed[num_c], errors="coerce").fillna(0)
                 ymd_list = [parse_ymd(v) for v in df_closed["일시"]]
                 df_closed["_ymd"] = ymd_list
                 df_closed["_date_str"] = [f"{x[0]:04d}-{x[1]:02d}-{x[2]:02d}" if x else str(raw)[:10] for x, raw in zip(ymd_list, df_closed["일시"])]
@@ -531,24 +532,37 @@ def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
     """
     components.html(html_code, height=height + 6)
 
-# ================= 5. 무청산 안전 레버리지 & 병렬 고속 스캔 =================
-def calc_safe_leverage(entry, sl, margin, beta=1.0, is_btc=False):
-    sl_pct = abs(entry - sl) / entry * 100
-    if sl_pct <= 0.1:
-        sl_pct = 1.0
+# ================= 5. 목표 역산 맞춤 배율 계산기 & 병렬 고속 스캔 =================
+def calc_goal_adjusted_leverage(entry, sl, tp, entry_margin, daily_goal_usd, beta=1.0, is_btc=False):
+    sl_pct = max(0.5, abs(entry - sl) / entry * 100)
+    tp_pct = max(0.5, abs(tp - entry) / entry * 100)
+
+    # 손절폭 기준 무청산 안전 최대 배율 계산
     effective_risk = sl_pct * 2.0 * max(1.0, beta)
-    max_safe = 100.0 / effective_risk
+    max_safe_lev = int(max(1, min(25 if is_btc else 15, round(100.0 / effective_risk))))
 
-    if margin <= 100:
-        scale = 0.90
-    elif margin <= 500:
-        scale = 0.65
+    # 오늘 목표 수익($)을 달성하기 위해 필요한 배율 역산
+    if entry_margin > 0 and tp_pct > 0 and daily_goal_usd > 0:
+        raw_needed_lev = math.ceil(daily_goal_usd / (entry_margin * (tp_pct / 100.0)))
     else:
-        scale = 0.45
+        raw_needed_lev = 3
 
-    cap = 25 if is_btc else 15
-    rec_lev = int(max(1, min(cap, round(max_safe * scale))))
-    return rec_lev, sl_pct
+    final_lev = max(1, min(max_safe_lev, raw_needed_lev))
+    est_tp_profit = entry_margin * (tp_pct / 100.0) * final_lev
+    est_sl_loss = entry_margin * (sl_pct / 100.0) * final_lev
+    trades_needed = max(1, math.ceil(daily_goal_usd / max(est_tp_profit, 0.01)))
+    capped_by_safety = raw_needed_lev > max_safe_lev
+
+    return {
+        "lev": final_lev,
+        "max_safe_lev": max_safe_lev,
+        "sl_pct": sl_pct,
+        "tp_pct": tp_pct,
+        "est_tp_profit": est_tp_profit,
+        "est_sl_loss": est_sl_loss,
+        "trades_needed": trades_needed,
+        "capped": capped_by_safety
+    }
 
 def analyze_single_alt(sym, btc_ret, btc_dir):
     try:
@@ -877,7 +891,7 @@ def fetch_coinness_style_news():
         res_lists = list(ex.map(load_feed, feeds))
     return [item for sub in res_lists for item in sub]
 
-# ================= 7. 보유 종목 1초 실시간 웹소켓 & 캘린더 렌더러 =================
+# ================= 7. 보유 종목 1초 실시간 웹소켓 & 캘린더 & 종료 매매 자동 분석 =================
 def render_live_positions_ws(pos_list):
     cards_html = ""
     for idx, p in enumerate(pos_list):
@@ -1012,6 +1026,61 @@ def render_pnl_calendar(df_closed, year, month):
     """
     st.markdown(cal_html, unsafe_allow_html=True)
 
+def diagnose_single_trade(row, wallet_bal):
+    sym = str(row.get("종목", ""))
+    pos = str(row.get("포지션", ""))
+    margin = float(row.get("증거금", 0))
+    lev = int(float(row.get("레버리지", 1)))
+    pnl = float(row.get("수익금", 0))
+    roi = float(row.get("수익률", 0))
+    dt = str(row.get("일시", ""))
+
+    reasons = []
+    if pnl < 0:
+        badge = f'<span class="badge-short">🔴 손실 복기 · {sym} {pos} (${pnl:+.2f} / {roi:+.1f}%)</span>'
+        if lev >= 10 or roi <= -45:
+            reasons.append(f"• <b>고배율 리스크({lev}배):</b> 배율이 높아 가격의 작은 역행에도 손실폭({roi:.1f}%)이 크게 확대되었습니다. 동일 종목 재진입 시 <b>5배 이하</b>로 낮추세요.")
+        if wallet_bal > 0 and margin > wallet_bal * 0.35:
+            ratio_pct = (margin / wallet_bal) * 100
+            reasons.append(f"• <b>시드 비중 과다(잔고의 {ratio_pct:.0f}% 투입):</b> 1회 투입금이 커서 손실 타격이 컸습니다. 시드의 <b>20~25% 이내</b>로 분할 진입해야 복리가 유지됩니다.")
+        if -45 < roi <= -15:
+            reasons.append(f"• <b>손절 지연({roi:.1f}%):</b> 허용 손절폭(-10~15%)을 넘겨 손실을 키운 뒤 종료되었습니다. 진입 즉시 스탑로스(SL) 예약을 걸어두세요.")
+        if not reasons:
+            reasons.append(f"• <b>짧은 손절 방어({roi:.1f}%):</b> 손절폭 자체는 잘 끊어냈으나 횡보 구간 추격 또는 BTC 역행 타이밍에 진입했을 가능성이 높습니다. 4시간봉 EMA 방향과 일치하는 자리만 노리세요.")
+    else:
+        badge = f'<span class="badge-long">🟢 수익 복기 · {sym} {pos} (${pnl:+.2f} / {roi:+.1f}%)</span>'
+        if roi < 8.0:
+            reasons.append(f"• <b>조기 익절 패턴(+{roi:.1f}%):</b> 수익 확정은 좋으나 목표가 도달 전 일찍 종료한 편입니다. 50% 반익절 후 나머지 물량은 본절 스탑을 걸고 목표가까지 끌고 가면 복리 속도가 빨라집니다.")
+        else:
+            reasons.append(f"• <b>이상적 손익비(+{roi:.1f}% · {lev}배):</b> 진입 근거와 배율 조절이 안정적이었습니다. 이 패턴을 유지하세요.")
+
+    return f"<div style='margin-bottom:8px;'>{badge} <span style='font-size:0.75rem; color:#8B949E;'>({dt})</span><div style='margin-top:4px;'>{'<br>'.join(reasons)}</div></div>"
+
+def build_overall_habit_diagnosis(df_closed):
+    if df_closed.empty:
+        return ""
+    wins_df = df_closed[df_closed["수익금"] > 0]
+    loss_df = df_closed[df_closed["수익금"] < 0]
+
+    avg_win = float(wins_df["수익금"].mean()) if not wins_df.empty else 0.0
+    avg_loss = abs(float(loss_df["수익금"].mean())) if not loss_df.empty else 0.0
+
+    long_df = df_closed[df_closed["포지션"].astype(str).str.contains("롱")]
+    short_df = df_closed[df_closed["포지션"].astype(str).str.contains("숏")]
+    long_wr = (long_df["수익금"] > 0).mean() * 100 if not long_df.empty else 0.0
+    short_wr = (short_df["수익금"] > 0).mean() * 100 if not short_df.empty else 0.0
+
+    notes = []
+    if avg_loss > 0 and avg_win > 0 and avg_loss > avg_win * 1.2:
+        notes.append(f"• <b>역손익비 주의:</b> 평균 익절(<b>+${avg_win:.2f}</b>)보다 평균 손절(<b>-${avg_loss:.2f}</b>)이 더 큽니다. 익절은 길게, 손절은 짧게 자르지 않으면 승률이 높아도 계좌가 제자리걸음을 합니다.")
+    elif avg_win > 0:
+        notes.append(f"• <b>양호한 손익비:</b> 평균 익절(<b>+${avg_win:.2f}</b>)이 평균 손절(<b>-${avg_loss:.2f}</b>)보다 크거나 잘 방어되고 있습니다.")
+
+    if not long_df.empty and not short_df.empty:
+        notes.append(f"• <b>방향별 승률 비교:</b> 롱 승률 <b>{long_wr:.0f}%</b> ({len(long_df)}건) vs 숏 승률 <b>{short_wr:.0f}%</b> ({len(short_df)}건) — 승률이 낮은 방향은 진입 기준을 한 단계 더 엄격하게 보세요.")
+
+    return "<br>".join(notes)
+
 # ================= 8. 실시간 자동 갱신 섹션(@st.fragment) =================
 @st.fragment(run_every="120s")
 def live_top_header_section():
@@ -1080,37 +1149,48 @@ def live_recommendations_section():
     acc_state = load_sheet_state()
     wallet_bal = acc_state["wallet_bal"]
     avail_bal = acc_state["avail_bal"]
-    base_seed = wallet_bal if wallet_bal > 0 else (avail_bal if avail_bal > 0 else 100.0)
+    base_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else (max(10.0, round(avail_bal, 2)) if avail_bal > 0 else 100.0)
 
-    if wallet_bal > 0:
-        st.markdown(f"""
-        <div class="metric-card" style="padding:10px 14px;">
-            <div style="font-size:0.8rem; color:#8B949E;">💰 실시간 바이낸스 선물 잔고 연동됨</div>
-            <div style="font-size:0.95rem; color:#F0F6FC; margin-top:2px;">
-                총 시드: <b style="color:#00D084;">${wallet_bal:,.2f}</b> &nbsp;|&nbsp;
-                주문 가능 잔고: <b style="color:#58A6FF;">${avail_bal:,.2f}</b>
-            </div>
-        </div>""", unsafe_allow_html=True)
+    if "goal_target" not in st.session_state:
+        st.session_state["goal_target"] = round(base_seed * 2.0, 2)
+    if "goal_days" not in st.session_state:
+        st.session_state["goal_days"] = 30
+
+    st.markdown("#### 🎯 내 시드 · 복리 목표 연동 자동 세팅")
+    g1, g2, g3 = st.columns(3)
+    cur_seed_disp = g1.number_input("현재 총 시드 ($)", min_value=10.0, value=base_seed, step=10.0, key="rec_seed_in")
+    target_goal = g2.number_input("목표 금액 ($)", min_value=cur_seed_disp + 5.0, value=max(cur_seed_disp + 5.0, float(st.session_state["goal_target"])), step=10.0, key="rec_target_in")
+    target_days = g3.number_input("목표 기간 (일)", min_value=3, max_value=365, value=int(st.session_state["goal_days"]), step=5, key="rec_days_in")
+
+    st.session_state["goal_target"] = target_goal
+    st.session_state["goal_days"] = target_days
+
+    growth_mult = target_goal / cur_seed_disp
+    req_daily_pct = ((growth_mult ** (1.0 / target_days)) - 1.0) * 100.0
+    daily_goal_usd = cur_seed_disp * (req_daily_pct / 100.0)
 
     ratio_choice = st.radio(
-        "📊 1회 진입 증거금 비중 (내 실시간 시드 기준)",
-        ["시드 20% (복리 권장)", "시드 50% (분할 2회)", "시드 100% (전액)", "직접 입력"],
+        "💰 1회 진입 증거금 비중",
+        ["시드 25% (권장)", "시드 50% (분할 2회)", "시드 100% (전액)"],
         horizontal=True
     )
-
-    if ratio_choice == "시드 20% (복리 권장)":
-        user_margin = max(5.0, round(base_seed * 0.20, 2))
-        st.caption(f"자동 계산된 1회 진입 증거금: **${user_margin:,.2f}** (총 시드 ${base_seed:,.2f}의 20%)")
+    if ratio_choice == "시드 25% (권장)":
+        entry_margin = round(cur_seed_disp * 0.25, 2)
     elif ratio_choice == "시드 50% (분할 2회)":
-        user_margin = max(5.0, round(base_seed * 0.50, 2))
-        st.caption(f"자동 계산된 1회 진입 증거금: **${user_margin:,.2f}** (총 시드 ${base_seed:,.2f}의 50%)")
-    elif ratio_choice == "시드 100% (전액)":
-        user_margin = max(5.0, round(base_seed, 2))
-        st.caption(f"자동 계산된 1회 진입 증거금: **${user_margin:,.2f}** (총 시드 전액)")
+        entry_margin = round(cur_seed_disp * 0.50, 2)
     else:
-        user_margin = st.number_input("💰 직접 입력 증거금 ($)", min_value=5.0, value=max(10.0, round(base_seed * 0.20, 2)), step=5.0)
+        entry_margin = round(cur_seed_disp, 2)
 
-    st.caption(f"⚡ 현물 차트 기준 고속 병렬 스캔 · 최근 갱신: {datetime.now(KST).strftime('%H:%M:%S')} (5분마다 자동 반영)")
+    st.markdown(f"""
+    <div class="metric-card" style="padding:10px 14px;">
+        <div style="font-size:0.84rem; color:#F0F6FC;">
+            오늘 목표 수익: <b style="color:#00D084;">+${daily_goal_usd:,.2f} (일 +{req_daily_pct:.2f}%)</b> &nbsp;|&nbsp;
+            1회 진입 증거금: <b style="color:#58A6FF;">${entry_margin:,.2f}</b>
+        </div>
+        <div style="font-size:0.76rem; color:#8B949E; margin-top:3px;">
+            아래 추천 종목의 배율과 수량은 오늘 목표(+${daily_goal_usd:,.2f}) 달성에 맞춰 무청산 한도 내에서 자동 조절되었습니다.
+        </div>
+    </div>""", unsafe_allow_html=True)
 
     btc_pick, alt_picks = scan_all_markets(ov)
     all_picks = [btc_pick] + alt_picks
@@ -1122,12 +1202,14 @@ def live_recommendations_section():
         badge_cls = "badge-long" if is_long else ("badge-short" if is_short else "badge-neutral")
         label_txt = "롱 (매수) 추천" if is_long else ("숏 (매도) 추천" if is_short else "횡보 관망")
 
-        rec_lev, sl_pct = calc_safe_leverage(p["price"], p["sl"], user_margin, p["beta"], p["is_btc"])
+        adj = calc_goal_adjusted_leverage(p["price"], p["sl"], p["tp"], entry_margin, daily_goal_usd, p["beta"], p["is_btc"])
+        rec_lev = adj["lev"]
         liq_price = p["price"] * (1 - (0.9 / rec_lev)) if is_long else p["price"] * (1 + (0.9 / rec_lev))
 
         corr_txt = "기준 대장주" if p["is_btc"] else (
             f"독자 행보 (디커플링 {p['corr']*100:.0f}%)" if p["corr"] < 0.35 else f"BTC 동조화 {p['corr']*100:.0f}% (변동성 {p['beta']:.1f}배)"
         )
+        cap_note = f" (청산 방어를 위해 안전 상한 {adj['max_safe_lev']}배로 자동 제한됨)" if adj["capped"] else " (목표 수익 1회 달성 맞춤 배율)"
 
         st.markdown(f"""
         <div class="{card_cls}">
@@ -1138,13 +1220,13 @@ def live_recommendations_section():
             <div style="font-size:0.78rem; color:#8B949E; margin-top:3px;">🔗 {corr_txt} · 현물 RSI(4H): {p['rsi']:.1f}</div>
             <div style="margin-top:8px; font-size:0.85rem; color:#8B949E;">
                 진입가: <b style="color:#F0F6FC;">${p['price']:,.4f}</b> &nbsp;|&nbsp;
-                손절가: <b style="color:#FF7B72;">${p['sl']:,.4f}</b> &nbsp;|&nbsp;
-                목표가: <b style="color:#7EE787;">${p['tp']:,.4f}</b>
+                손절가: <b style="color:#FF7B72;">${p['sl']:,.4f} (-{adj['sl_pct']:.1f}%)</b> &nbsp;|&nbsp;
+                목표가: <b style="color:#7EE787;">${p['tp']:,.4f} (+{adj['tp_pct']:.1f}%)</b>
             </div>
-            <div style="font-size:0.74rem; color:#8B949E; margin-top:2px;">※ 현물(Spot) 차트 기준 타점 · 선물 진입 시 호가 괴리만 확인</div>
             <div class="lev-box">
-                🛡️ <b>증거금 ${user_margin:,.2f} 기준 무청산 추천 배율: {rec_lev}배</b>
-                (예상 청산가: <b>${liq_price:,.4f}</b> · 손절폭 -{sl_pct:.1f}% 방어)
+                ⚙️ <b>자동 조절 세팅: 증거금 ${entry_margin:,.2f} × {rec_lev}배</b>{cap_note}<br>
+                🎯 목표가 익절 시: <b style="color:#7EE787;">+${adj['est_tp_profit']:,.2f}</b> (오늘 목표 달성까지 약 <b>{adj['trades_needed']}회</b> 성공 필요)<br>
+                🛡️ 손절가 손실: <b style="color:#FF7B72;">-${adj['est_sl_loss']:,.2f}</b> · 예상 청산가: <b>${liq_price:,.4f}</b>
             </div>
             <div class="reason-box">
                 <div style="font-weight:bold; color:#58A6FF; margin-bottom:4px;">💡 현물 파동 & 피보나치 추천 근거</div>
@@ -1286,60 +1368,81 @@ def live_trade_journal_section():
         valid_cols = [c for c in display_cols if c in view_df.columns]
         st.dataframe(view_df[valid_cols].iloc[::-1], use_container_width=True, hide_index=True)
 
+        # --- [영역 C-2] 매매 종료 자동 원인 진단 리포트 ---
+        st.markdown("#### 🔍 종료 매매 자동 원인 분석 (AI 복기)")
+        recent_rows = df_closed.iloc[::-1].head(4)
+        diag_blocks = "".join([diagnose_single_trade(r, wallet_bal) for _, r in recent_rows.iterrows()])
+        habit_summary = build_overall_habit_diagnosis(df_closed)
+
+        st.markdown(f"""
+        <div class="reason-box">
+            {diag_blocks}
+            <hr style="border-color:#21262D; margin:10px 0;">
+            <div style="font-weight:bold; color:#58A6FF; margin-bottom:4px;">📊 전체 매매 습관 패턴 진단</div>
+            <div>{habit_summary}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
     st.markdown("---")
 
     # --- [영역 D] 목표 기반 복리 플래너 & 손익 상황별 대응 대책 ---
     st.markdown("#### 🎯 복리 목표 플래너 & 상황별 대응 전략")
     default_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else 100.0
+    if "goal_target" not in st.session_state:
+        st.session_state["goal_target"] = round(default_seed * 2.0, 2)
+    if "goal_days" not in st.session_state:
+        st.session_state["goal_days"] = 30
+
     g1, g2, g3 = st.columns(3)
-    start_seed = g1.number_input("시작 시드 ($)", min_value=10.0, value=default_seed, step=10.0)
-    target_seed = g2.number_input("목표 금액 ($)", min_value=start_seed + 5.0, value=round(start_seed * 2.0, 2), step=10.0)
-    goal_days = g3.number_input("목표 기간 (일)", min_value=3, max_value=365, value=30, step=5)
+    start_seed = g1.number_input("시작 시드 ($)", min_value=10.0, value=default_seed, step=10.0, key="jr_seed_in")
+    target_seed = g2.number_input("목표 금액 ($)", min_value=start_seed + 5.0, value=max(start_seed + 5.0, float(st.session_state["goal_target"])), step=10.0, key="jr_target_in")
+    goal_days = g3.number_input("목표 기간 (일)", min_value=3, max_value=365, value=int(st.session_state["goal_days"]), step=5, key="jr_days_in")
+
+    st.session_state["goal_target"] = target_seed
+    st.session_state["goal_days"] = goal_days
 
     growth_mult = target_seed / start_seed
     req_daily_rate = ((growth_mult ** (1.0 / goal_days)) - 1.0) * 100.0
     day1_profit_target = start_seed * (req_daily_rate / 100.0)
 
     k1, k2 = st.columns(2)
-    k1.metric("하루 필요 복리 수익률", f"{req_daily_rate:.2f}% / 일", f"첫날 목표 +${day1_profit_target:,.2f}")
+    k1.metric("하루 필요 복리 수익률", f"{req_daily_rate:.2f}% / 일", f"오늘 목표 +${day1_profit_target:,.2f}")
     k2.metric("목표 배수 / 총 필요 수익", f"{growth_mult:.2f}배", f"+${target_seed - start_seed:,.2f}")
 
     if req_daily_rate <= 2.5:
         plan_badge = '<span class="badge-long">🟢 현실적·안정 복리 플랜 (달성 가능성 높음)</span>'
         plan_advice = (
             f"하루 <b>{req_daily_rate:.2f}%</b> 복리는 무리한 고배율 없이도 충분히 달성 가능한 속도입니다. "
-            f"<b>시드의 20%(${start_seed * 0.20:,.2f})</b>씩 3~5배 저배율로만 진입해 손절(-1.5%)은 작게 자르고, "
+            f"<b>시드의 25%(${start_seed * 0.25:,.2f})</b>씩 3~5배 저배율로만 진입해 손절(-1.5%)은 작게 자르고, "
             f"확실한 4시간봉 추세 자리에서만 1일 1~2회 익절하는 전략이 가장 유리합니다."
         )
     elif req_daily_rate <= 6.0:
         plan_badge = '<span class="badge-neutral">🟡 공격적 복리 플랜 (철저한 손절 필수)</span>'
         plan_advice = (
-            f"하루 <b>{req_daily_rate:.2f}%</b>를 복리로 쌓으려면 1회 진입 시드 대비 약 <b>{req_daily_rate * 3:.1f}%~{req_daily_rate * 5:.1f}%</b> 수익을 매일 내야 합니다. "
-            f"횡보장 잦은 매매는 수수료로 시드를 갉아먹으므로 <b>거래량 터지는 돌파·눌림목 1~2자리만 엄선</b>하고, "
-            f"목표 수익 달성 시 당일 차트를 바로 닫는 '익절 후 퇴근' 규칙이 핵심입니다."
+            f"하루 <b>{req_daily_rate:.2f}%</b>를 복리로 쌓으려면 거래량 터지는 돌파·눌림목 1~2자리만 엄선해야 합니다. "
+            f"목표 수익(+${day1_profit_target:,.2f}) 달성 시 당일 차트를 바로 닫는 '익절 후 퇴근' 규칙이 핵심입니다."
         )
     else:
         plan_badge = '<span class="badge-short">🔴 과욕 경계 (고배율 청산 위험 구간)</span>'
         plan_advice = (
-            f"하루 <b>{req_daily_rate:.2f}%</b> 복리는 10배 이상 고배율 풀시드를 매일 성공해야 나오는 수치라 한 번의 반대 빔에 계좌가 초기화될 위험이 큽니다. "
+            f"하루 <b>{req_daily_rate:.2f}%</b> 복리는 한 번의 반대 빔에 계좌가 초기화될 위험이 큽니다. "
             f"<b>목표 기간을 {int(np.ceil(np.log(growth_mult) / np.log(1.03)))}일 이상으로 늘리거나</b> 목표 금액을 낮춰 하루 2~3% 복리 속도로 조절하는 것을 권장합니다."
         )
 
-    # 최근 매매 손익 흐름에 따른 맞춤형 행동 지침
     if recent_streak_pnl < 0:
         flow_title = f"🚨 최근 매매 손실(${recent_streak_pnl:,.2f}) 방어 대책 (손실 구간 대응)"
         loss_pct = min(90.0, abs(recent_streak_pnl) / max(start_seed, 1.0) * 100)
         recov_pct = (100.0 / max(100.0 - loss_pct, 10.0) - 1.0) * 100.0
         flow_advice = (
             f"• <b>본전 회복 착시 주의:</b> 시드가 {loss_pct:.1f}% 줄면 원금 복구에 <b>+{recov_pct:.1f}%</b> 수익이 필요합니다. 한 번에 만회하려고 배율을 올리면 청산으로 직결됩니다.<br>"
-            f"• <b>비중 절반 축소 룰:</b> 다음 2~3번의 매매는 평소 투입금의 절반(<b>${start_seed * 0.10:,.2f}</b>)으로 줄여 감각부터 회복하세요.<br>"
+            f"• <b>비중 절반 축소 룰:</b> 다음 2~3번의 매매는 평소 투입금의 절반(<b>${start_seed * 0.12:,.2f}</b>)으로 줄여 감각부터 회복하세요.<br>"
             f"• <b>일일 손실 한도(-${start_seed * 0.05:,.2f}):</b> 하루 손실이 시드의 5%를 넘기면 당일 바이낸스 앱을 종료하고 다음 날 새 캔들에서 다시 시작하세요."
         )
     else:
         flow_title = "📈 수익 구간 복리 증액 & 원금 보호 대책 (벌고 있을 때 대응)"
         skim_target = start_seed * 1.5
         flow_advice = (
-            f"• <b>복리 비중 자동 증액:</b> 잔고가 늘어날 때마다 1회 투입금도 현재 시드의 20%(<b>${start_seed * 0.20:,.2f}</b>) 비율로 함께 늘려야 복리 효과가 작동합니다.<br>"
+            f"• <b>복리 비중 자동 증액:</b> 잔고가 늘어날 때마다 1회 투입금도 현재 시드의 25%(<b>${start_seed * 0.25:,.2f}</b>) 비율로 함께 늘려야 복리 효과가 작동합니다.<br>"
             f"• <b>원금 회수 스키밍 (1차 목표 ${skim_target:,.2f}):</b> 시드가 현재 대비 +50%(<b>${skim_target:,.2f}</b>)에 도달하면 수익의 절반(<b>${start_seed * 0.25:,.2f}</b>)을 현물 지갑으로 출금해 원금을 먼저 회수하세요.<br>"
             f"• <b>연승 후 자만 경계:</b> 3연승 이상 직후에는 레버리지를 높이고 싶은 심리가 강해집니다. 수익이 날수록 배율은 5배 이하로 고정하세요."
         )
