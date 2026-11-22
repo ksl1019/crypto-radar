@@ -74,7 +74,78 @@ def safe_get_json(url, headers=None, timeout=4):
     except Exception:
         return None
 
-# ================= 1. 병렬 시장 요약 & 매크로 데이터 수집 =================
+def parse_ymd(val_str):
+    nums = re.findall(r"\d+", str(val_str))
+    if len(nums) >= 3:
+        y, m, d = int(nums[0]), int(nums[1]), int(nums[2])
+        if y < 100:
+            y += 2000
+        return y, m, d
+    return None
+
+# ================= 1. 구글 시트 계좌 · 보유종목 · 매매일지 통합 로더 =================
+@st.cache_data(ttl=25)
+def load_sheet_state():
+    sheet_url = st.secrets.get("SHEET_URL", "")
+    state = {
+        "has_url": bool(sheet_url),
+        "wallet_bal": 0.0,
+        "avail_bal": 0.0,
+        "used_margin": 0.0,
+        "open_list": [],
+        "df_closed": pd.DataFrame(),
+        "error": None
+    }
+    if not sheet_url:
+        return state
+
+    try:
+        rows = requests.get(sheet_url, timeout=8).json()
+        if len(rows) > 1:
+            clean_headers = [str(c).strip() for c in rows[0]]
+            if clean_headers and clean_headers[0] != "일시":
+                clean_headers[0] = "일시"
+            df_all = pd.DataFrame(rows[1:], columns=clean_headers)
+
+            for req_col in ["일시", "종목", "포지션", "증거금", "레버리지", "진입가", "종료가", "수익금", "수익률", "근거태그", "메모"]:
+                if req_col not in df_all.columns:
+                    df_all[req_col] = ""
+
+            tag_col = df_all["근거태그"].astype(str)
+            memo_col = df_all["메모"].astype(str)
+
+            # 1) 총 증거금(지갑 잔고) 스냅샷
+            bal_mask = tag_col.str.startswith("BAL_SNAPSHOT|")
+            df_bal = df_all[bal_mask]
+            if not df_bal.empty:
+                last_b = df_bal.iloc[-1]
+                state["wallet_bal"] = float(pd.to_numeric(last_b["증거금"], errors="coerce") or 0)
+                state["avail_bal"] = float(pd.to_numeric(last_b["진입가"], errors="coerce") or 0)
+                state["used_margin"] = float(pd.to_numeric(last_b["종료가"], errors="coerce") or 0)
+
+            # 2) 현재 보유 포지션 스냅샷
+            open_mask = tag_col.str.startswith("OPEN_SNAPSHOT|") | memo_col.str.startswith("OPEN_SNAPSHOT|")
+            df_open = df_all[tag_col.str.startswith("OPEN_SNAPSHOT|")].copy()
+            if not df_open.empty:
+                latest_batch = df_open["근거태그"].iloc[-1]
+                cur_open = df_open[(df_open["근거태그"] == latest_batch) & (df_open["종목"] != "NONE")]
+                state["open_list"] = cur_open.to_dict("records")
+
+            # 3) 실제 종료된 매매 기록
+            exclude_mask = bal_mask | open_mask | (df_all["종목"].isin(["WALLET", "NONE"]))
+            df_closed = df_all[~exclude_mask].copy()
+            if not df_closed.empty:
+                df_closed["수익금"] = pd.to_numeric(df_closed["수익금"], errors="coerce").fillna(0)
+                df_closed["수익률"] = pd.to_numeric(df_closed["수익률"], errors="coerce").fillna(0)
+                ymd_list = [parse_ymd(v) for v in df_closed["일시"]]
+                df_closed["_ymd"] = ymd_list
+                df_closed["_date_str"] = [f"{x[0]:04d}-{x[1]:02d}-{x[2]:02d}" if x else str(raw)[:10] for x, raw in zip(ymd_list, df_closed["일시"])]
+            state["df_closed"] = df_closed
+    except Exception as e:
+        state["error"] = str(e)
+    return state
+
+# ================= 2. 병렬 시장 요약 & 매크로 데이터 수집 =================
 @st.cache_data(ttl=120)
 def get_market_overview():
     urls = {
@@ -252,7 +323,7 @@ def get_spot_orderbook_heatmap(symbol="BTCUSDT"):
     top_ask_vol = float(ask_grp["notional"].max())
     return combined, top_bid_price, top_bid_vol, top_ask_price, top_ask_vol
 
-# ================= 2. 현물 엘리어트 파동(꼬리 규칙) & 피보나치 확장 예측 =================
+# ================= 3. 현물 엘리어트 파동(꼬리 규칙) & 피보나치 확장 예측 =================
 def fmt_p(val):
     return f"${val:,.4f}" if val < 10 else f"${val:,.1f}"
 
@@ -326,7 +397,7 @@ def analyze_spot_wave_and_fib(df, tf_name):
     )
     return html_desc, chart_lines, w1_high, fib_ext_100, fib_ext_1618, fib_ret_618, fib_ret_382
 
-# ================= 3. 트레이딩뷰 모바일 캔들 & CVD 차트 렌더러 =================
+# ================= 4. 트레이딩뷰 모바일 캔들 & CVD 차트 렌더러 =================
 def render_tv_candle_chart(df, chart_id, price_lines=None, show_ema=True, show_waves=True, height=340):
     sub = df.copy().reset_index(drop=True)
     candles = [
@@ -460,7 +531,7 @@ def render_tv_cvd_chart(df, chart_id="tv_cvd_chart", height=220):
     """
     components.html(html_code, height=height + 6)
 
-# ================= 4. 무청산 안전 레버리지 & 병렬 고속 스캔 =================
+# ================= 5. 무청산 안전 레버리지 & 병렬 고속 스캔 =================
 def calc_safe_leverage(entry, sl, margin, beta=1.0, is_btc=False):
     sl_pct = abs(entry - sl) / entry * 100
     if sl_pct <= 0.1:
@@ -635,7 +706,7 @@ def scan_all_markets(overview):
     top_alts = sorted(alt_picks, key=lambda x: x["score"], reverse=True)[:5]
     return btc_pick, top_alts
 
-# ================= 5. 실시간 경제 일정(발표치 판독) & 금·환율·속보 =================
+# ================= 6. 실시간 경제 일정(발표치 판독) & 금·환율·속보 =================
 def parse_metric_num(val_str):
     if not val_str:
         return None
@@ -806,20 +877,20 @@ def fetch_coinness_style_news():
         res_lists = list(ex.map(load_feed, feeds))
     return [item for sub in res_lists for item in sub]
 
-# ================= 6. 보유 종목 1초 실시간 웹소켓 & 캘린더 렌더러 =================
+# ================= 7. 보유 종목 1초 실시간 웹소켓 & 캘린더 렌더러 =================
 def render_live_positions_ws(pos_list):
     cards_html = ""
     for idx, p in enumerate(pos_list):
-        sym = str(p["종목"])
-        is_long = "롱" in str(p["포지션"])
+        sym = str(p.get("종목", ""))
+        is_long = "롱" in str(p.get("포지션", ""))
         border_col = "#00D084" if is_long else "#FF4B4B"
         badge_bg = "rgba(0, 208, 132, 0.15)" if is_long else "rgba(255, 75, 75, 0.15)"
         badge_col = "#00D084" if is_long else "#FF4B4B"
 
-        entry_p = float(p["진입가"])
-        init_mark = float(p["종료가"])
-        margin = float(p["증거금"])
-        lev = int(float(p["레버리지"]))
+        entry_p = float(pd.to_numeric(p.get("진입가", 0), errors="coerce") or 0)
+        init_mark = float(pd.to_numeric(p.get("종료가", 0), errors="coerce") or 0)
+        margin = float(pd.to_numeric(p.get("증거금", 0), errors="coerce") or 0)
+        lev = int(float(pd.to_numeric(p.get("레버리지", 1), errors="coerce") or 1))
         memo_parts = str(p.get("메모", "0|0")).split("|")
         qty = float(memo_parts[0]) if len(memo_parts) > 0 and memo_parts[0] else (margin * lev / entry_p if entry_p > 0 else 0)
         liq_p = float(memo_parts[1]) if len(memo_parts) > 1 and memo_parts[1] else 0.0
@@ -833,7 +904,7 @@ def render_live_positions_ws(pos_list):
         <div style="background:#161B22; border:1px solid #30363D; border-left:4px solid {border_col}; border-radius:10px; padding:14px; margin-bottom:10px; font-family:sans-serif;">
           <div style="display:flex; justify-content:space-between; align-items:center;">
             <span style="font-size:16px; font-weight:bold; color:#FFFFFF;">{sym} ({lev}배)</span>
-            <span style="background:{badge_bg}; color:{badge_col}; padding:3px 8px; border-radius:6px; font-weight:bold; font-size:12px;">{p['포지션']} · ● LIVE</span>
+            <span style="background:{badge_bg}; color:{badge_col}; padding:3px 8px; border-radius:6px; font-weight:bold; font-size:12px;">{p.get('포지션', '')} · ● LIVE</span>
           </div>
           <div style="margin-top:8px; font-size:13px; color:#C9D1D9;">
             진입가: <b>${entry_p:,.{prec}f}</b> &nbsp;|&nbsp;
@@ -851,15 +922,15 @@ def render_live_positions_ws(pos_list):
 
     js_items = []
     for idx, p in enumerate(pos_list):
-        entry_p = float(p["진입가"])
-        margin = float(p["증거금"])
-        lev = int(float(p["레버리지"]))
+        entry_p = float(pd.to_numeric(p.get("진입가", 0), errors="coerce") or 0)
+        margin = float(pd.to_numeric(p.get("증거금", 0), errors="coerce") or 0)
+        lev = int(float(pd.to_numeric(p.get("레버리지", 1), errors="coerce") or 1))
         memo_parts = str(p.get("메모", "0|0")).split("|")
         qty = float(memo_parts[0]) if len(memo_parts) > 0 and memo_parts[0] else (margin * lev / entry_p if entry_p > 0 else 0)
         js_items.append({
             "idx": idx,
-            "stream": f"{str(p['종목']).lower()}@markPrice@1s",
-            "isLong": "롱" in str(p["포지션"]),
+            "stream": f"{str(p.get('종목', '')).lower()}@markPrice@1s",
+            "isLong": "롱" in str(p.get("포지션", "")),
             "entry": entry_p,
             "qty": qty,
             "margin": margin,
@@ -903,14 +974,13 @@ def render_pnl_calendar(df_closed, year, month):
     month_days = cal.monthdayscalendar(year, month)
 
     daily_map = {}
-    if not df_closed.empty and "일시" in df_closed.columns:
-        temp = df_closed.copy()
-        temp["date_only"] = temp["일시"].astype(str).str.slice(0, 10)
-        prefix = f"{year:04d}-{month:02d}-"
-        m_df = temp[temp["date_only"].str.startswith(prefix)]
-        for d_str, grp in m_df.groupby("date_only"):
-            day_num = int(d_str.split("-")[2])
-            daily_map[day_num] = (float(grp["수익금"].sum()), len(grp))
+    if not df_closed.empty and "_ymd" in df_closed.columns:
+        for _, r in df_closed.iterrows():
+            ymd = r["_ymd"]
+            if ymd and ymd[0] == year and ymd[1] == month:
+                d_num = ymd[2]
+                prev_pnl, prev_cnt = daily_map.get(d_num, (0.0, 0))
+                daily_map[d_num] = (prev_pnl + float(r["수익금"]), prev_cnt + 1)
 
     weekdays = ["일", "월", "화", "수", "목", "금", "토"]
     th_html = "".join([f"<th style='padding:6px; font-size:12px; color:#8B949E; text-align:center;'>{w}</th>" for w in weekdays])
@@ -920,18 +990,18 @@ def render_pnl_calendar(df_closed, year, month):
         tds = ""
         for d in week:
             if d == 0:
-                tds += "<td style='background:#0D1117; border:1px solid #21262D; height:58px;'></td>"
+                tds += "<td style='background:#0D1117; border:1px solid #21262D; height:60px;'></td>"
             else:
                 if d in daily_map:
                     pnl_val, cnt = daily_map[d]
-                    bg = "rgba(0, 208, 132, 0.14)" if pnl_val >= 0 else "rgba(255, 75, 75, 0.14)"
+                    bg = "rgba(0, 208, 132, 0.16)" if pnl_val >= 0 else "rgba(255, 75, 75, 0.16)"
                     col = "#00D084" if pnl_val >= 0 else "#FF4B4B"
-                    pnl_txt = f"{pnl_val:+.1f}$"
+                    pnl_txt = f"{pnl_val:+.2f}$"
                     sub_txt = f"<div style='font-size:11px; font-weight:bold; color:{col}; margin-top:2px;'>{pnl_txt}</div><div style='font-size:10px; color:#8B949E;'>{cnt}건</div>"
                 else:
                     bg = "#161B22"
                     sub_txt = "<div style='font-size:10px; color:#30363D; margin-top:6px;'>-</div>"
-                tds += f"<td style='background:{bg}; border:1px solid #30363D; vertical-align:top; padding:4px; width:14.2%; height:58px; text-align:center;'><div style='font-size:11px; color:#C9D1D9; text-align:left;'>{d}</div>{sub_txt}</td>"
+                tds += f"<td style='background:{bg}; border:1px solid #30363D; vertical-align:top; padding:4px; width:14.2%; height:60px; text-align:center;'><div style='font-size:11px; color:#C9D1D9; text-align:left;'>{d}</div>{sub_txt}</td>"
         rows_html += f"<tr>{tds}</tr>"
 
     cal_html = f"""
@@ -942,7 +1012,7 @@ def render_pnl_calendar(df_closed, year, month):
     """
     st.markdown(cal_html, unsafe_allow_html=True)
 
-# ================= 7. 실시간 자동 갱신 섹션(@st.fragment) =================
+# ================= 8. 실시간 자동 갱신 섹션(@st.fragment) =================
 @st.fragment(run_every="120s")
 def live_top_header_section():
     ov = get_market_overview()
@@ -1007,7 +1077,39 @@ def live_cvd_and_firechart_section():
 @st.fragment(run_every="300s")
 def live_recommendations_section():
     ov = get_market_overview()
-    user_margin = st.number_input("💰 내 이번 진입 증거금 ($)", min_value=10.0, value=100.0, step=10.0)
+    acc_state = load_sheet_state()
+    wallet_bal = acc_state["wallet_bal"]
+    avail_bal = acc_state["avail_bal"]
+    base_seed = wallet_bal if wallet_bal > 0 else (avail_bal if avail_bal > 0 else 100.0)
+
+    if wallet_bal > 0:
+        st.markdown(f"""
+        <div class="metric-card" style="padding:10px 14px;">
+            <div style="font-size:0.8rem; color:#8B949E;">💰 실시간 바이낸스 선물 잔고 연동됨</div>
+            <div style="font-size:0.95rem; color:#F0F6FC; margin-top:2px;">
+                총 시드: <b style="color:#00D084;">${wallet_bal:,.2f}</b> &nbsp;|&nbsp;
+                주문 가능 잔고: <b style="color:#58A6FF;">${avail_bal:,.2f}</b>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    ratio_choice = st.radio(
+        "📊 1회 진입 증거금 비중 (내 실시간 시드 기준)",
+        ["시드 20% (복리 권장)", "시드 50% (분할 2회)", "시드 100% (전액)", "직접 입력"],
+        horizontal=True
+    )
+
+    if ratio_choice == "시드 20% (복리 권장)":
+        user_margin = max(5.0, round(base_seed * 0.20, 2))
+        st.caption(f"자동 계산된 1회 진입 증거금: **${user_margin:,.2f}** (총 시드 ${base_seed:,.2f}의 20%)")
+    elif ratio_choice == "시드 50% (분할 2회)":
+        user_margin = max(5.0, round(base_seed * 0.50, 2))
+        st.caption(f"자동 계산된 1회 진입 증거금: **${user_margin:,.2f}** (총 시드 ${base_seed:,.2f}의 50%)")
+    elif ratio_choice == "시드 100% (전액)":
+        user_margin = max(5.0, round(base_seed, 2))
+        st.caption(f"자동 계산된 1회 진입 증거금: **${user_margin:,.2f}** (총 시드 전액)")
+    else:
+        user_margin = st.number_input("💰 직접 입력 증거금 ($)", min_value=5.0, value=max(10.0, round(base_seed * 0.20, 2)), step=5.0)
+
     st.caption(f"⚡ 현물 차트 기준 고속 병렬 스캔 · 최근 갱신: {datetime.now(KST).strftime('%H:%M:%S')} (5분마다 자동 반영)")
 
     btc_pick, alt_picks = scan_all_markets(ov)
@@ -1041,7 +1143,7 @@ def live_recommendations_section():
             </div>
             <div style="font-size:0.74rem; color:#8B949E; margin-top:2px;">※ 현물(Spot) 차트 기준 타점 · 선물 진입 시 호가 괴리만 확인</div>
             <div class="lev-box">
-                🛡️ <b>증거금 ${user_margin:,.0f} 기준 무청산 추천 배율: {rec_lev}배</b>
+                🛡️ <b>증거금 ${user_margin:,.2f} 기준 무청산 추천 배율: {rec_lev}배</b>
                 (예상 청산가: <b>${liq_price:,.4f}</b> · 손절폭 -{sl_pct:.1f}% 방어)
             </div>
             <div class="reason-box">
@@ -1119,49 +1221,21 @@ def live_news_section():
                 </div>
             </div>""", unsafe_allow_html=True)
 
-@st.fragment(run_every="60s")
+@st.fragment(run_every="45s")
 def live_trade_journal_section():
-    sheet_url = st.secrets.get("SHEET_URL", "")
-    if not sheet_url:
+    acc_state = load_sheet_state()
+    if not acc_state["has_url"]:
         st.warning("Streamlit Secrets에 SHEET_URL이 설정되지 않았습니다.")
         return
 
-    wallet_bal, avail_bal, used_margin = 0.0, 0.0, 0.0
-    cur_open_list = []
-    df_closed = pd.DataFrame()
+    if acc_state["error"]:
+        st.warning(f"구글 시트 데이터 동기화 중입니다: {acc_state['error']}")
 
-    try:
-        rows = requests.get(sheet_url, timeout=8).json()
-        if len(rows) > 1:
-            df_all = pd.DataFrame(rows[1:], columns=rows[0])
-            tag_col = df_all["근거태그"].astype(str)
-            memo_col = df_all["메모"].astype(str)
-
-            # 1) 총 증거금(지갑 잔고) 스냅샷 추출
-            bal_mask = tag_col.str.startswith("BAL_SNAPSHOT|")
-            df_bal = df_all[bal_mask]
-            if not df_bal.empty:
-                last_b = df_bal.iloc[-1]
-                wallet_bal = float(pd.to_numeric(last_b["증거금"], errors="coerce") or 0)
-                avail_bal = float(pd.to_numeric(last_b["진입가"], errors="coerce") or 0)
-                used_margin = float(pd.to_numeric(last_b["종료가"], errors="coerce") or 0)
-
-            # 2) 현재 보유 포지션 스냅샷 추출
-            open_mask = tag_col.str.startswith("OPEN_SNAPSHOT|") | memo_col.str.startswith("OPEN_SNAPSHOT|")
-            df_open = df_all[tag_col.str.startswith("OPEN_SNAPSHOT|")].copy()
-            if not df_open.empty:
-                latest_batch = df_open["근거태그"].iloc[-1]
-                cur_open = df_open[(df_open["근거태그"] == latest_batch) & (df_open["종목"] != "NONE")]
-                cur_open_list = cur_open.to_dict("records")
-
-            # 3) 실제 종료된 매매 기록만 분리
-            exclude_mask = bal_mask | open_mask | (df_all["종목"].isin(["WALLET", "NONE"]))
-            df_closed = df_all[~exclude_mask].copy()
-            if not df_closed.empty:
-                df_closed["수익금"] = pd.to_numeric(df_closed["수익금"], errors="coerce").fillna(0)
-                df_closed["수익률"] = pd.to_numeric(df_closed["수익률"], errors="coerce").fillna(0)
-    except Exception as e:
-        st.warning(f"구글 시트 데이터 동기화 중입니다: {e}")
+    wallet_bal = acc_state["wallet_bal"]
+    avail_bal = acc_state["avail_bal"]
+    used_margin = acc_state["used_margin"]
+    cur_open_list = acc_state["open_list"]
+    df_closed = acc_state["df_closed"]
 
     # --- [영역 A] 선물 계좌 총 증거금(시드) ---
     st.markdown("#### 💰 내 바이낸스 선물 증거금 총액")
@@ -1188,22 +1262,25 @@ def live_trade_journal_section():
 
     render_pnl_calendar(df_closed, sel_year, sel_month)
 
+    total_pnl = 0.0
+    recent_streak_pnl = 0.0
     if df_closed.empty:
-        st.caption("아직 종료된 매매 기록이 없습니다. 보유 포지션을 익절·손절로 종료하면 캘린더와 아래 표에 자동 기록됩니다.")
+        st.caption("아직 종료된 매매 기록이 없습니다. 보유 포지션을 익절·손절로 종료하면 캘린더와 아래 표에 즉시 반영됩니다.")
     else:
-        total_pnl = df_closed["수익금"].sum()
-        wins = (df_closed["수익금"] > 0).sum()
+        total_pnl = float(df_closed["수익금"].sum())
+        wins = int((df_closed["수익금"] > 0).sum())
         total_trades = len(df_closed)
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+        recent_streak_pnl = float(df_closed["수익금"].tail(3).sum())
 
         m1, m2, m3 = st.columns(3)
         m1.metric("종료 매매", f"{total_trades}건")
         m2.metric("전체 승률", f"{win_rate:.1f}%", f"{wins}승 {total_trades-wins}패")
         m3.metric("누적 실현손익", f"${total_pnl:+,.2f}")
 
-        date_options = ["전체 내역 보기"] + sorted(df_closed["일시"].astype(str).str.slice(0, 10).unique().tolist(), reverse=True)
+        date_options = ["전체 내역 보기"] + sorted(df_closed["_date_str"].unique().tolist(), reverse=True)
         sel_day = st.selectbox("🔍 날짜별 상세 필터", date_options)
-        view_df = df_closed if sel_day == "전체 내역 보기" else df_closed[df_closed["일시"].astype(str).str.startswith(sel_day)]
+        view_df = df_closed if sel_day == "전체 내역 보기" else df_closed[df_closed["_date_str"] == sel_day]
 
         display_cols = ["일시", "종목", "포지션", "증거금", "레버리지", "진입가", "종료가", "수익금", "수익률", "메모"]
         valid_cols = [c for c in display_cols if c in view_df.columns]
@@ -1211,32 +1288,73 @@ def live_trade_journal_section():
 
     st.markdown("---")
 
-    # --- [영역 D] 복리 시뮬레이터 & 계좌 보호 대책 ---
-    st.markdown("#### 📈 복리 시뮬레이터 & 계좌 방어 대책")
+    # --- [영역 D] 목표 기반 복리 플래너 & 손익 상황별 대응 대책 ---
+    st.markdown("#### 🎯 복리 목표 플래너 & 상황별 대응 전략")
     default_seed = max(10.0, round(wallet_bal, 2)) if wallet_bal > 0 else 100.0
-    s1, s2, s3 = st.columns(3)
-    seed_input = s1.number_input("시작 시드 ($)", min_value=10.0, value=default_seed, step=10.0)
-    daily_pct = s2.number_input("목표 일 수익률 (%)", min_value=0.5, max_value=30.0, value=3.0, step=0.5)
-    sim_days = s3.number_input("운용 일수 (일)", min_value=5, max_value=180, value=30, step=5)
+    g1, g2, g3 = st.columns(3)
+    start_seed = g1.number_input("시작 시드 ($)", min_value=10.0, value=default_seed, step=10.0)
+    target_seed = g2.number_input("목표 금액 ($)", min_value=start_seed + 5.0, value=round(start_seed * 2.0, 2), step=10.0)
+    goal_days = g3.number_input("목표 기간 (일)", min_value=3, max_value=365, value=30, step=5)
 
-    final_seed = seed_input * ((1 + daily_pct / 100) ** sim_days)
-    net_gain = final_seed - seed_input
-    mult = final_seed / seed_input
+    growth_mult = target_seed / start_seed
+    req_daily_rate = ((growth_mult ** (1.0 / goal_days)) - 1.0) * 100.0
+    day1_profit_target = start_seed * (req_daily_rate / 100.0)
 
-    r1, r2 = st.columns(2)
-    r1.metric(f"{sim_days}일 후 복리 예상 잔고", f"${final_seed:,.2f}", f"+${net_gain:,.2f} ({mult:.1f}배)")
-    r2.metric("1회 권장 최대 투입금 (시드 20%)", f"${seed_input * 0.20:,.2f}", f"일일 손절 한도 -${seed_input * 0.05:,.2f}")
+    k1, k2 = st.columns(2)
+    k1.metric("하루 필요 복리 수익률", f"{req_daily_rate:.2f}% / 일", f"첫날 목표 +${day1_profit_target:,.2f}")
+    k2.metric("목표 배수 / 총 필요 수익", f"{growth_mult:.2f}배", f"+${target_seed - start_seed:,.2f}")
+
+    if req_daily_rate <= 2.5:
+        plan_badge = '<span class="badge-long">🟢 현실적·안정 복리 플랜 (달성 가능성 높음)</span>'
+        plan_advice = (
+            f"하루 <b>{req_daily_rate:.2f}%</b> 복리는 무리한 고배율 없이도 충분히 달성 가능한 속도입니다. "
+            f"<b>시드의 20%(${start_seed * 0.20:,.2f})</b>씩 3~5배 저배율로만 진입해 손절(-1.5%)은 작게 자르고, "
+            f"확실한 4시간봉 추세 자리에서만 1일 1~2회 익절하는 전략이 가장 유리합니다."
+        )
+    elif req_daily_rate <= 6.0:
+        plan_badge = '<span class="badge-neutral">🟡 공격적 복리 플랜 (철저한 손절 필수)</span>'
+        plan_advice = (
+            f"하루 <b>{req_daily_rate:.2f}%</b>를 복리로 쌓으려면 1회 진입 시드 대비 약 <b>{req_daily_rate * 3:.1f}%~{req_daily_rate * 5:.1f}%</b> 수익을 매일 내야 합니다. "
+            f"횡보장 잦은 매매는 수수료로 시드를 갉아먹으므로 <b>거래량 터지는 돌파·눌림목 1~2자리만 엄선</b>하고, "
+            f"목표 수익 달성 시 당일 차트를 바로 닫는 '익절 후 퇴근' 규칙이 핵심입니다."
+        )
+    else:
+        plan_badge = '<span class="badge-short">🔴 과욕 경계 (고배율 청산 위험 구간)</span>'
+        plan_advice = (
+            f"하루 <b>{req_daily_rate:.2f}%</b> 복리는 10배 이상 고배율 풀시드를 매일 성공해야 나오는 수치라 한 번의 반대 빔에 계좌가 초기화될 위험이 큽니다. "
+            f"<b>목표 기간을 {int(np.ceil(np.log(growth_mult) / np.log(1.03)))}일 이상으로 늘리거나</b> 목표 금액을 낮춰 하루 2~3% 복리 속도로 조절하는 것을 권장합니다."
+        )
+
+    # 최근 매매 손익 흐름에 따른 맞춤형 행동 지침
+    if recent_streak_pnl < 0:
+        flow_title = f"🚨 최근 매매 손실(${recent_streak_pnl:,.2f}) 방어 대책 (손실 구간 대응)"
+        loss_pct = min(90.0, abs(recent_streak_pnl) / max(start_seed, 1.0) * 100)
+        recov_pct = (100.0 / max(100.0 - loss_pct, 10.0) - 1.0) * 100.0
+        flow_advice = (
+            f"• <b>본전 회복 착시 주의:</b> 시드가 {loss_pct:.1f}% 줄면 원금 복구에 <b>+{recov_pct:.1f}%</b> 수익이 필요합니다. 한 번에 만회하려고 배율을 올리면 청산으로 직결됩니다.<br>"
+            f"• <b>비중 절반 축소 룰:</b> 다음 2~3번의 매매는 평소 투입금의 절반(<b>${start_seed * 0.10:,.2f}</b>)으로 줄여 감각부터 회복하세요.<br>"
+            f"• <b>일일 손실 한도(-${start_seed * 0.05:,.2f}):</b> 하루 손실이 시드의 5%를 넘기면 당일 바이낸스 앱을 종료하고 다음 날 새 캔들에서 다시 시작하세요."
+        )
+    else:
+        flow_title = "📈 수익 구간 복리 증액 & 원금 보호 대책 (벌고 있을 때 대응)"
+        skim_target = start_seed * 1.5
+        flow_advice = (
+            f"• <b>복리 비중 자동 증액:</b> 잔고가 늘어날 때마다 1회 투입금도 현재 시드의 20%(<b>${start_seed * 0.20:,.2f}</b>) 비율로 함께 늘려야 복리 효과가 작동합니다.<br>"
+            f"• <b>원금 회수 스키밍 (1차 목표 ${skim_target:,.2f}):</b> 시드가 현재 대비 +50%(<b>${skim_target:,.2f}</b>)에 도달하면 수익의 절반(<b>${start_seed * 0.25:,.2f}</b>)을 현물 지갑으로 출금해 원금을 먼저 회수하세요.<br>"
+            f"• <b>연승 후 자만 경계:</b> 3연승 이상 직후에는 레버리지를 높이고 싶은 심리가 강해집니다. 수익이 날수록 배율은 5배 이하로 고정하세요."
+        )
 
     st.markdown(f"""
     <div class="reason-box">
-        <div style="font-weight:bold; color:#FFA657; margin-bottom:6px;">🛡️ 복리 계좌 파산 방지 3대 실전 대책 (현재 시드 ${seed_input:,.2f} 기준)</div>
-        • <b>1. 1회 진입 비중 상한 (최대 20% = ${seed_input * 0.20:,.2f}):</b> 복리는 시드가 커질수록 한 번의 청산 타격이 큽니다. 전체 시드의 20% 이하로만 진입하고 물타기 여유분 80%를 현금으로 남겨두세요.<br>
-        • <b>2. 일일 손실 서킷 브레이커 (-5% = -${seed_input * 0.05:,.2f}):</b> 하루 누적 손실이 시드의 5%에 도달하면 복구 매매(뇌동매매)를 멈추고 그날 차트를 끄는 규칙을 지켜야 복리 곡선이 유지됩니다.<br>
-        • <b>3. 원금 회수 스키밍 (목표: ${seed_input * 1.5:,.2f} 도달 시):</b> 잔고가 현재 시드 대비 +50%(<b>${seed_input * 1.5:,.2f}</b>)에 도달할 때마다 수익의 절반(<b>${seed_input * 0.25:,.2f}</b>)을 현물 지갑으로 출금해 '무손실 안전 계좌'로 전환하세요.
+        {plan_badge}
+        <div style="margin-top:6px;">{plan_advice}</div>
+        <hr style="border-color:#21262D; margin:10px 0;">
+        <div style="font-weight:bold; color:#FFA657; margin-bottom:4px;">{flow_title}</div>
+        <div>{flow_advice}</div>
     </div>
     """, unsafe_allow_html=True)
 
-# ================= 8. 메인 화면 렌더링 =================
+# ================= 9. 메인 화면 렌더링 =================
 st.markdown("### 📡 코인 선물 레이더")
 st.caption("BTC 시세와 보유 포지션은 1초마다 실시간 반영되며, 화면 깜빡임 없이 자동 갱신됩니다.")
 
