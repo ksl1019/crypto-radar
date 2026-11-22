@@ -64,6 +64,11 @@ st.markdown("""
         background-color: #161B22; border: 1px solid #30363D;
         border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
     }
+    .etf-row {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 6px 0; border-bottom: 1px solid #21262D; font-size: 0.82rem;
+    }
+    .etf-row:last-child { border-bottom: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -80,7 +85,6 @@ def format_kst_datetime(val):
     if not s:
         return ""
     try:
-        # 2026-11-22T11:51:00.000Z 또는 ISO 문자열 파싱 후 KST(+9h) 변환
         norm = s.replace("Z", "+00:00")
         dt = datetime.fromisoformat(norm)
         if dt.tzinfo is None:
@@ -100,7 +104,7 @@ def parse_ymd(val_str):
     return None
 
 def consolidate_closed_trades(df_raw):
-    """같은 종목·같은 포지션·같은 분(또는 2분 이내) 분할 청산 조각을 실제 1건으로 병합"""
+    """같은 종목·같은 포지션·2분 이내 분할 청산 조각을 실제 1건으로 병합"""
     if df_raw.empty:
         return df_raw
 
@@ -259,7 +263,7 @@ def save_goal_to_sheet(target_val, days_val, ratio_idx):
     except Exception:
         pass
 
-# ================= 2. 병렬 시장 요약 · 매크로 · 수급/온체인/김프 데이터 수집 =================
+# ================= 2. 병렬 시장 요약 · 미국 현물 ETF 실시간 수치 · 파생/김프/도미넌스 수집 =================
 @st.cache_data(ttl=90)
 def get_market_overview():
     urls = {
@@ -271,12 +275,17 @@ def get_market_overview():
         "fng": "https://api.alternative.me/fng/",
         "dom": "https://api.coingecko.com/api/v3/global",
         "upbit": "https://api.upbit.com/v1/ticker?markets=KRW-BTC",
-        "fx": "https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?interval=1d&range=2d"
+        "fx": "https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?interval=1d&range=2d",
+        "etf_ibit": "https://query1.finance.yahoo.com/v8/finance/chart/IBIT?interval=1d&range=5d",
+        "etf_fbtc": "https://query1.finance.yahoo.com/v8/finance/chart/FBTC?interval=1d&range=5d",
+        "etf_bitb": "https://query1.finance.yahoo.com/v8/finance/chart/BITB?interval=1d&range=5d",
+        "etf_arkb": "https://query1.finance.yahoo.com/v8/finance/chart/ARKB?interval=1d&range=5d",
+        "etf_gbtc": "https://query1.finance.yahoo.com/v8/finance/chart/GBTC?interval=1d&range=5d"
     }
     headers = {"User-Agent": "Mozilla/5.0"}
-    with ThreadPoolExecutor(max_workers=9) as ex:
+    with ThreadPoolExecutor(max_workers=12) as ex:
         futures = {
-            k: ex.submit(safe_get_json, u, headers if k in ["fx", "upbit"] else None)
+            k: ex.submit(safe_get_json, u, headers if (k in ["fx", "upbit"] or k.startswith("etf_")) else None)
             for k, u in urls.items()
         }
         res = {k: f.result() for k, f in futures.items()}
@@ -298,6 +307,7 @@ def get_market_overview():
     oi_btc = 0.0
     if res["oi"] and res["oi"].get("data"):
         oi_btc = float(res["oi"]["data"][0].get("oiCcy") or 0)
+    oi_usd_m = (oi_btc * btc_price_num) / 1e6 if (oi_btc > 0 and btc_price_num > 0) else 0.0
 
     ls_ratio = 1.0
     if res["ls"] and res["ls"].get("data") and len(res["ls"]["data"]) > 0:
@@ -316,7 +326,6 @@ def get_market_overview():
         btc_dom_num = float(res["dom"]["data"]["market_cap_percentage"]["btc"])
         btc_dom = f"{btc_dom_num:.1f}%"
 
-    # 김치프리미엄 계산 (업비트 KRW-BTC vs 바이낸스 BTCUSDT * 환율)
     kimchi_pct = None
     upbit_krw = 0.0
     fx_rate = 0.0
@@ -331,14 +340,43 @@ def get_market_overview():
     except Exception:
         kimchi_pct = None
 
+    # 미국 5대 현물 ETF 실제 주가 · 등락률 · 거래대금 파싱
+    etf_meta_list = [
+        ("IBIT (블랙록)", "etf_ibit"),
+        ("FBTC (피델리티)", "etf_fbtc"),
+        ("BITB (비트와이즈)", "etf_bitb"),
+        ("ARKB (아크)", "etf_arkb"),
+        ("GBTC (그레이스케일)", "etf_gbtc")
+    ]
+    etf_rows = []
+    for label, key in etf_meta_list:
+        raw_etf = res.get(key)
+        try:
+            meta = raw_etf["chart"]["result"][0]["meta"]
+            cur_p = float(meta["regularMarketPrice"])
+            prev_p = float(meta["chartPreviousClose"])
+            chg_p = ((cur_p - prev_p) / prev_p) * 100.0
+            vol_sh = float(meta.get("regularMarketVolume") or 0)
+            dollar_vol_m = (cur_p * vol_sh) / 1e6
+            etf_rows.append({
+                "name": label,
+                "price": cur_p,
+                "chg": chg_p,
+                "vol_sh": vol_sh,
+                "dollar_vol_m": dollar_vol_m
+            })
+        except Exception:
+            pass
+
     return {
         "fng_val": fng_val, "fng_class": fng_class,
         "btc_dom": btc_dom, "btc_dom_num": btc_dom_num,
         "btc_price_num": btc_price_num, "btc_chg_num": btc_chg_num,
         "eth_chg_num": eth_chg_num,
         "funding_rate": funding_rate, "funding_num": funding_num,
-        "oi_btc": oi_btc, "ls_ratio": ls_ratio,
-        "kimchi_pct": kimchi_pct, "upbit_krw": upbit_krw, "fx_rate": fx_rate
+        "oi_btc": oi_btc, "oi_usd_m": oi_usd_m, "ls_ratio": ls_ratio,
+        "kimchi_pct": kimchi_pct, "upbit_krw": upbit_krw, "fx_rate": fx_rate,
+        "etf_rows": etf_rows
     }
 
 def render_realtime_top_board(ov):
@@ -483,82 +521,115 @@ def get_spot_orderbook_heatmap(symbol="BTCUSDT"):
     top_ask_vol = float(ask_grp["notional"].max())
     return combined, top_bid_price, top_bid_vol, top_ask_price, top_ask_vol
 
-def build_btc_flow_and_onchain_brief(ov, btc_1d_df):
-    """주식 외인·기관 수급 대응 비트코인 기관/고래/파생/보유자·실현손익 브리핑"""
-    last_1d = btc_1d_df.iloc[-1]
-    prev_30d_avg = float(btc_1d_df["close"].tail(30).mean())
-    prev_180d_avg = float(btc_1d_df["close"].tail(180).mean())
-    cur_p = float(last_1d["close"])
+# ================= 2-1. 실제 숫자 기반 수급 · ETF · 파생 · 온체인 한국어 해설 빌더 =================
+def render_numeric_btc_intelligence(ov, btc_1d_df):
+    # 1) 미국 5대 비트코인 현물 ETF 실제 시세·거래량·거래대금
+    etf_rows = ov.get("etf_rows", [])
+    etf_list_html = ""
+    total_etf_dollar_m = sum(x["dollar_vol_m"] for x in etf_rows)
+    avg_etf_chg = np.mean([x["chg"] for x in etf_rows]) if etf_rows else 0.0
 
-    # 단기 보유자(STH, ~1개월 평균 매수가 근사) vs 장기 보유자(LTH, ~6개월 평균 매수가 근사) 상태
-    sth_profit = cur_p >= prev_30d_avg
-    lth_profit = cur_p >= prev_180d_avg
-
-    if not sth_profit and lth_profit:
-        holder_status = "🟡 단기 보유자 손실 구간 · 장기 보유자 방어 중"
-        holder_detail = (
-            f"현재가(${cur_p:,.0f})가 30일 평균(${prev_30d_avg:,.0f}) 아래라 단기 매수 물량이 손실 구간에 있어 반등 시 차익·본전 매물이 나올 수 있지만, "
-            f"180일 평균(${prev_180d_avg:,.0f}) 기준 장기 물량 방어력을 체크해야 합니다."
+    for item in etf_rows:
+        c_col = "#00D084" if item["chg"] >= 0 else "#FF4B4B"
+        etf_list_html += (
+            f'<div class="etf-row">'
+            f'<span style="color:#F0F6FC; font-weight:bold;">{item["name"]}</span>'
+            f'<span>${item["price"]:,.2f} <b style="color:{c_col};">({item["chg"]:+.2f}%)</b> · 거래대금 <b>${item["dollar_vol_m"]:,.1f}M</b></span>'
+            f'</div>'
         )
-    elif sth_profit and lth_profit:
-        holder_status = "🟢 단기·장기 보유자 모두 수익 구간 (상승 모멘텀)"
-        holder_detail = "단기·장기 보유자 다수가 수익권에 있어 투매 압력이 약하고 추세 추종 매수세가 우호적인 구간입니다."
-    else:
-        holder_status = "🔴 단기·장기 보유자 광범위 손실 (투매/바닥 다지기 구간)"
-        holder_detail = "단기·장기 평균 매수가 아래로 내려와 손절 출회와 항복(Capitulation) 매물이 소화되는지 확인해야 하는 구간입니다."
 
-    # 선물 미결제약정 & 롱/숏 비율 & 펀딩비 조합
-    ls_r = ov["ls_ratio"]
-    if ls_r >= 1.6 and ov["funding_num"] > 0.01:
-        deriv_status = f"🔴 롱 과열 주의 (롱숏비 {ls_r:.2f} · OI {ov['oi_btc']:,.0f} BTC)"
-        deriv_detail = "개인·파생 롱 포지션이 한쪽으로 쏠려 있어 급락 시 연쇄 청산(Long Squeeze) 위험이 큽니다."
-    elif ls_r <= 0.85 and ov["funding_num"] < 0:
-        deriv_status = f"🟢 숏 쏠림·스퀴즈 여력 (롱숏비 {ls_r:.2f} · OI {ov['oi_btc']:,.0f} BTC)"
-        deriv_detail = "숏 포지션이 우세하고 펀딩비가 음수(-)라 가격 반등 시 숏 물량 청산에 따른 급등 스퀴즈가 나올 수 있습니다."
-    else:
-        deriv_status = f"⚪ 파생 수급 균형 (롱숏비 {ls_r:.2f} · OI {ov['oi_btc']:,.0f} BTC)"
-        deriv_detail = "롱·숏 비율이 과열 극단치를 벗어나 있어 현물 추세와 거래소 유입·유출 방향을 함께 봐야 합니다."
-
-    # 김치프리미엄 & BTC 도미넌스 & ETH 상대 강도
-    kimp = ov["kimchi_pct"]
-    if kimp is not None:
-        if kimp >= 3.0:
-            kimp_line = f"🇰🇷 <b>김치프리미엄 {kimp:+.2f}% (국내 과열 경계):</b> 업비트(${ov['upbit_krw']:,.0f}원 / 환율 ₩{ov['fx_rate']:,.1f}) 기준 국내 매수 열기가 높아 단기 역프 회귀에 주의하세요."
-        elif kimp <= -0.5:
-            kimp_line = f"🇰🇷 <b>김치프리미엄 {kimp:+.2f}% (역프리미엄·국내 관망):</b> 해외 대비 국내 프리미엄이 낮아 국내 개인 추격 매수가 약한 상태입니다."
+    if etf_rows:
+        if avg_etf_chg > 0.5:
+            etf_badge = f'<span class="badge-long">🟢 미국 현물 ETF 강세 (평균 {avg_etf_chg:+.2f}% · 총 거래대금 ${total_etf_dollar_m:,.1f}M)</span>'
+            etf_analysis = f"미국 5대 현물 ETF(IBIT·FBTC 등) 주가가 평균 <b>{avg_etf_chg:+.2f}%</b> 상승하며 총 <b>${total_etf_dollar_m:,.1f}M</b> 규모 거래가 실렸습니다. 월가 장중 매수 수급이 우호적인 흐름입니다."
+        elif avg_etf_chg < -0.5:
+            etf_badge = f'<span class="badge-short">🔴 미국 현물 ETF 약세 (평균 {avg_etf_chg:+.2f}% · 총 거래대금 ${total_etf_dollar_m:,.1f}M)</span>'
+            etf_analysis = f"미국 5대 현물 ETF가 평균 <b>{avg_etf_chg:+.2f}%</b> 하락하며 거래대금 <b>${total_etf_dollar_m:,.1f}M</b>을 기록했습니다. 기관·ETF 매도 출회 압력이 살아있어 단기 반등 시 저항을 체크해야 합니다."
         else:
-            kimp_line = f"🇰🇷 <b>김치프리미엄 {kimp:+.2f}% (정상 범위):</b> 국내외 가격 괴리가 크지 않아 글로벌 시세 흐름을 그대로 따라가고 있습니다."
+            etf_badge = f'<span class="badge-neutral">⚪ 미국 현물 ETF 보합권 (평균 {avg_etf_chg:+.2f}% · 총 거래대금 ${total_etf_dollar_m:,.1f}M)</span>'
+            etf_analysis = f"5대 현물 ETF가 평균 <b>{avg_etf_chg:+.2f}%</b>의 좁은 변동폭 속에서 총 <b>${total_etf_dollar_m:,.1f}M</b> 거래되었습니다. 본장 방향성 탐색 구간입니다."
     else:
-        kimp_line = "🇰🇷 <b>김치프리미엄:</b> 업비트/환율 시세를 실시간 불러오는 중입니다."
+        etf_badge = '<span class="badge-neutral">⚪ 미국 현물 ETF 데이터 동기화 중</span>'
+        etf_analysis = "야후 파이낸스에서 IBIT·FBTC·BITB·ARKB·GBTC 시세를 불러오는 중입니다."
 
-    eth_vs_btc = ov["eth_chg_num"] - ov["btc_chg_num"]
-    dom_line = (
-        f"👑 <b>도미넌스({ov['btc_dom']}) & 알트 순환매:</b> 24h 등락률 BTC {ov['btc_chg_num']:+.2f}% vs ETH {ov['eth_chg_num']:+.2f}% "
-        f"(상대강도 {eth_vs_btc:+.2f}%) — "
-        + ("비트코인 비중 집중 장세로 알트코인 변동성 확대에 주의하세요." if ov["btc_dom_num"] >= 55 else "자금이 메이저·알트 쪽으로도 일부 순환하는 구간입니다.")
-    )
-
-    # 기관(현물 ETF) · 거래소 입출금/고래 · 실현손익(SOPR/Realized P&L) 체크 포인트
-    etf_line = (
-        f"🏦 <b>기관·ETF & 거래소/고래 수급 체크:</b> 공포·탐욕 <b>{ov['fng_val']}({ov['fng_class']})</b> · "
-        f"펀딩비 <b>{ov['funding_rate']}</b>. 미국 현물 ETF 순유입/순유출 방향과 거래소 입금(매도 압력) vs 출금(매집) 흐름, "
-        f"그리고 온체인 <b>실현 손익(Realized P/L·SOPR)</b>이 손실 확정(1 미만)인지 익절 확정(1 초과)인지 함께 확인하세요."
-    )
-
-    return f"""
+    st.markdown(f"""
     <div class="metric-card">
-        <div style="font-weight:bold; color:#F0F6FC; margin-bottom:6px;">🏦 비트코인 기관·고래·파생·온체인 수급 브리핑 (실시간)</div>
-        <div class="reason-box" style="margin-top:4px;">
-            <div><b>{deriv_status}</b><br><span style="font-size:0.8rem; color:#8B949E;">{deriv_detail}</span></div>
-            <hr style="border-color:#21262D; margin:8px 0;">
-            <div><b>{holder_status}</b><br><span style="font-size:0.8rem; color:#8B949E;">{holder_detail}</span></div>
-            <hr style="border-color:#21262D; margin:8px 0;">
-            <div style="margin-bottom:5px;">{kimp_line}</div>
-            <div style="margin-bottom:5px;">{dom_line}</div>
-            <div>{etf_line}</div>
+        <div style="font-weight:bold; color:#F0F6FC; margin-bottom:6px;">🇺🇸 미국 현물 ETF 실시간 시세 · 거래대금 (기관 수급 대용)</div>
+        {etf_list_html}
+        <div class="reason-box">
+            {etf_badge}
+            <div style="margin-top:5px;"><b>[보는 법]</b> 블랙록(IBIT)·피델리티(FBTC) 등 현물 ETF의 주가 등락률과 거래대금($M)이 함께 오르면 월가 기관 매수세가 유입된다는 신호입니다.</div>
+            <div style="margin-top:4px;"><b>[현재 분석]</b> {etf_analysis}</div>
         </div>
     </div>
-    """
+    """, unsafe_allow_html=True)
+
+    # 2) 파생상품 미결제약정(OI) · 롱/숏 비율 · 펀딩비 숫자 + 한국어 해설
+    ls_r = ov["ls_ratio"]
+    oi_btc = ov["oi_btc"]
+    oi_usd_m = ov["oi_usd_m"]
+    fund_num = ov["funding_num"]
+
+    if ls_r >= 1.5 and fund_num > 0.01:
+        deriv_badge = f'<span class="badge-short">🔴 롱 포지션 과열 (롱숏비 {ls_r:.2f} · 펀딩비 {ov["funding_rate"]})</span>'
+        deriv_analysis = f"롱 계정이 숏 계정보다 <b>{ls_r:.2f}배</b> 많고 미결제약정(OI)이 <b>{oi_btc:,.0f} BTC (${oi_usd_m:,.1f}M)</b> 쌓여 있습니다. 롱 쏠림이 심해 하방 청산 빔(Long Squeeze) 위험이 큽니다."
+    elif ls_r <= 0.85 and fund_num < 0:
+        deriv_badge = f'<span class="badge-long">🟢 숏 쏠림 · 숏 스퀴즈 여력 (롱숏비 {ls_r:.2f} · 펀딩비 {ov["funding_rate"]})</span>'
+        deriv_analysis = f"숏 비중이 우세(롱숏비 <b>{ls_r:.2f}</b>)하고 펀딩비가 <b>{ov['funding_rate']}</b> 음수 구간입니다. 가격 반등 시 숏 포지션 강제 청산이 연쇄 매수로 이어질 가능성이 높습니다."
+    else:
+        deriv_badge = f'<span class="badge-neutral">⚪ 파생 수급 균형 (롱숏비 {ls_r:.2f} · OI {oi_btc:,.0f} BTC)</span>'
+        deriv_analysis = f"미결제약정(OI)은 <b>{oi_btc:,.0f} BTC (약 ${oi_usd_m:,.1f}M)</b>, 롱/숏 계정 비율은 <b>{ls_r:.2f} : 1</b>로 한쪽 극단 쏠림 없이 균형 잡힌 상태입니다."
+
+    # 3) 김치프리미엄 & 도미넌스 & ETH 상대 강도 숫자 + 한국어 해설
+    kimp = ov["kimchi_pct"]
+    if kimp is not None:
+        kimp_txt = f"{kimp:+.2f}% (업비트 ₩{ov['upbit_krw']:,.0f} vs 해외 환산 ₩{ov['btc_price_num']*ov['fx_rate']:,.0f})"
+        if kimp >= 3.0:
+            kimp_analysis = f"김치프리미엄이 <b>{kimp:+.2f}%</b>까지 벌어져 국내 개인 매수 열기가 과열권입니다. 단기 차익 매물 출회 가능성을 경계하세요."
+        elif kimp <= -0.5:
+            kimp_analysis = f"김치프리미엄이 <b>{kimp:+.2f}%</b> 역프리미엄 구간으로 국내 매수 심리가 냉각된 바닥권 신호입니다."
+        else:
+            kimp_analysis = f"김치프리미엄 <b>{kimp:+.2f}%</b> (환율 ₩{ov['fx_rate']:,.1f} 기준)로 국내외 시세가 정상 범위에서 연동 중입니다."
+    else:
+        kimp_txt = "집계 중"
+        kimp_analysis = "업비트와 환율 데이터를 동기화 중입니다."
+
+    eth_diff = ov["eth_chg_num"] - ov["btc_chg_num"]
+    dom_analysis = (
+        f"BTC 도미넌스 <b>{ov['btc_dom']}</b>, 24시간 등락률 <b>BTC {ov['btc_chg_num']:+.2f}% vs ETH {ov['eth_chg_num']:+.2f}% (격차 {eth_diff:+.2f}%p)</b>. "
+        + ("비트코인이 시장을 주도하며 알트코인 자금을 흡수하는 장세입니다." if eth_diff < 0 else "이더리움·알트코인이 비트코인보다 강하게 반등하는 순환매 흐름입니다.")
+    )
+
+    # 4) 기간별 보유자 평균 매수단가(30일·90일·180일) 대비 현재가 이격도 숫자 + 한국어 해설
+    cur_p = float(btc_1d_df["close"].iloc[-1])
+    avg_30 = float(btc_1d_df["close"].tail(30).mean())
+    avg_90 = float(btc_1d_df["close"].tail(90).mean())
+    avg_180 = float(btc_1d_df["close"].tail(180).mean())
+    diff_30 = (cur_p - avg_30) / avg_30 * 100
+    diff_90 = (cur_p - avg_90) / avg_90 * 100
+    diff_180 = (cur_p - avg_180) / avg_180 * 100
+
+    holder_analysis = (
+        f"현재가(<b>${cur_p:,.0f}</b>) 기준 · <b>30일 단기 평균가 ${avg_30:,.0f} ({diff_30:+.1f}%)</b> / "
+        f"<b>90일 중기 평균가 ${avg_90:,.0f} ({diff_90:+.1f}%)</b> / <b>180일 장기 평균가 ${avg_180:,.0f} ({diff_180:+.1f}%)</b>. "
+        + ("단기(30일)·장기(180일) 평균가 모두 상회해 매수 세력이 수익 구간을 방어 중입니다." if (diff_30 >= 0 and diff_180 >= 0) else "단기 평균가 아래에 위치해 단기 물량의 본전 매물 소화 여부를 확인해야 합니다.")
+    )
+
+    st.markdown(f"""
+    <div class="metric-card">
+        <div style="font-weight:bold; color:#F0F6FC; margin-bottom:6px;">⚡ 파생상품 · 김프 · 도미넌스 · 보유자 단가 분석 (실시간 수치)</div>
+        <div class="reason-box">
+            {deriv_badge}
+            <div style="margin-top:5px;"><b>[파생 보는 법]</b> 미결제약정(OI)이 늘면서 한쪽 비율이 1.5를 넘으면 반대 방향 청산 빔(스퀴즈)이 자주 나옵니다.<br><b>[현재 분석]</b> {deriv_analysis}</div>
+            <hr style="border-color:#21262D; margin:8px 0;">
+            <div><b>🇰🇷 김치프리미엄:</b> {kimp_txt}<br><b>[보는 법 & 분석]</b> +3% 이상이면 국내 과열, 마이너스(-)면 국내 침체 구간입니다. {kimp_analysis}</div>
+            <hr style="border-color:#21262D; margin:8px 0;">
+            <div><b>👑 도미넌스 & 순환매:</b> {dom_analysis}</div>
+            <hr style="border-color:#21262D; margin:8px 0;">
+            <div><b>📊 기간별 평균 매수단가 이격도:</b> {holder_analysis}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 # ================= 3. 현물 스윙 고·저점 기반 피보나치 & 추세 정밀 분석 =================
 def fmt_p(val):
@@ -1565,21 +1636,22 @@ def live_cvd_and_firechart_section():
 
         price_up = btc_4h_df["close"].iloc[-1] > btc_4h_df["close"].iloc[-6]
         cvd_up = btc_4h_df["cvd"].iloc[-1] > btc_4h_df["cvd"].iloc[-6]
+        delta_24h = float(btc_4h_df["delta"].tail(6).sum())
 
         if price_up and cvd_up:
-            cvd_badge = '<span class="badge-long">🟢 호재 (실매수 유입 동반 상승)</span>'
+            cvd_badge = f'<span class="badge-long">🟢 호재 (실매수 유입 동반 상승 · 24h 순매수 {delta_24h:+,.0f} BTC)</span>'
             cvd_desc = "4시간봉 현물 가격이 오르는 동안 실제 시장가 매수 체결(CVD)도 같이 늘어나고 있습니다. 현물 매수세가 뒷받침되는 건강한 상승입니다."
         elif (not price_up) and cvd_up:
-            cvd_badge = '<span class="badge-long">🟢 반등 신호 (저점 매도 물량 흡수)</span>'
+            cvd_badge = f'<span class="badge-long">🟢 반등 신호 (저점 매도 물량 흡수 · 24h 순매수 {delta_24h:+,.0f} BTC)</span>'
             cvd_desc = "가격은 눌렸지만 4시간봉 CVD는 오히려 버티거나 올라가고 있습니다. 현물 시장에서 매도 물량을 받아내고 있어 단기 반등 확률이 높습니다."
         elif price_up and (not cvd_up):
-            cvd_badge = '<span class="badge-short">🔴 악재 경계 (수급 없는 가짜 반등 주의)</span>'
+            cvd_badge = f'<span class="badge-short">🔴 악재 경계 (수급 없는 반등 · 24h 순매도 {delta_24h:+,.0f} BTC)</span>'
             cvd_desc = "가격만 살짝 올랐을 뿐 실제 시장가 매수세는 빠져나가고 있습니다. 저항선 부근에서 다시 밀릴 위험이 크니 롱 추격을 자제하세요."
         else:
-            cvd_badge = '<span class="badge-short">🔴 악재 (매도 출회 우세 · 하방 압력)</span>'
+            cvd_badge = f'<span class="badge-short">🔴 악재 (매도 출회 우세 · 24h 순매도 {delta_24h:+,.0f} BTC)</span>'
             cvd_desc = "가격 하락과 함께 시장가 매도 물량이 계속 쏟아지고 있습니다. CVD 바닥 다지기 확인 전까지는 롱 진입을 보류하세요."
 
-        st.markdown(f'<div class="reason-box">{cvd_badge}<div style="margin-top:5px;">{cvd_desc}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="reason-box"><b>[CVD 보는 법]</b> 시장가 매수 체결량에서 시장가 매도 체결량을 뺀 누적치입니다. 가격이 내려도 선이 올라가면 큰손 매집 신호입니다.<br><b>[현재 분석]</b> {cvd_badge}<div style="margin-top:5px;">{cvd_desc}</div></div>', unsafe_allow_html=True)
     except Exception:
         st.warning("CVD 수급 차트를 불러오는 중입니다.")
 
@@ -1600,15 +1672,15 @@ def live_cvd_and_firechart_section():
         ratio = top_bid_v / (top_ask_v + 1e-9)
         if ratio >= 1.25:
             fire_badge = '<span class="badge-long">🟢 하방 지지 우세 (매수 방어벽 두터움)</span>'
-            fire_desc = f"하단 <b>${top_bid_p:,.0f}</b> 부근의 현물 매수 대기 물량이 상단 매도벽(<b>${top_ask_p:,.0f}</b>)보다 약 <b>{ratio:.1f}배</b> 두껍게 깔려 있습니다."
+            fire_desc = f"하단 <b>${top_bid_p:,.0f}</b> 부근의 현물 매수 대기 물량(<b>${top_bid_v/1e6:.1f}M</b>)이 상단 매도벽(<b>${top_ask_p:,.0f} · ${top_ask_v/1e6:.1f}M</b>)보다 약 <b>{ratio:.1f}배</b> 두껍게 깔려 있습니다."
         elif ratio <= 0.8:
             fire_badge = '<span class="badge-short">🔴 상방 저항 우세 (매도 저항벽 두터움)</span>'
-            fire_desc = f"상단 <b>${top_ask_p:,.0f}</b> 부근에 매도 물량이 하단 지지벽(<b>${top_bid_p:,.0f}</b>)보다 두껍게 쌓여 있습니다. 도달 시 저항 압력이 큽니다."
+            fire_desc = f"상단 <b>${top_ask_p:,.0f}</b> 부근에 매도 물량(<b>${top_ask_v/1e6:.1f}M</b>)이 하단 지지벽(<b>${top_bid_p:,.0f} · ${top_bid_v/1e6:.1f}M</b>)보다 두껍게 쌓여 있습니다. 도달 시 저항 압력이 큽니다."
         else:
             fire_badge = '<span class="badge-neutral">⚪ 매수·매도벽 균형 (박스권 대치)</span>'
-            fire_desc = f"상단 저항벽(<b>${top_ask_p:,.0f}</b>)과 하단 지지벽(<b>${top_bid_p:,.0f}</b>) 규모가 비슷해 두 매물벽 사이에서 횡보할 가능성이 높습니다."
+            fire_desc = f"상단 저항벽(<b>${top_ask_p:,.0f} · ${top_ask_v/1e6:.1f}M</b>)과 하단 지지벽(<b>${top_bid_p:,.0f} · ${top_bid_v/1e6:.1f}M</b>) 규모가 비슷해 두 매물벽 사이에서 횡보할 가능성이 높습니다."
 
-        st.markdown(f'<div class="reason-box">{fire_badge}<div style="margin-top:5px;">{fire_desc}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="reason-box"><b>[파이어차트 보는 법]</b> 현물 호가창에 실제로 걸려 있는 지정가 매수·매도 대기 금액($M)입니다. 두꺼운 막대가 있는 가격대가 단기 지지선·저항선 역할을 합니다.<br><b>[현재 분석]</b> {fire_badge}<div style="margin-top:5px;">{fire_desc}</div></div>', unsafe_allow_html=True)
     except Exception:
         st.warning("호가창 유동성 히트맵을 불러오는 중입니다.")
 
@@ -2006,7 +2078,7 @@ with tab1:
 
     try:
         btc_1d_calc = calc_indicators(tf_dfs[2])
-        st.markdown(build_btc_flow_and_onchain_brief(ov_b, btc_1d_calc), unsafe_allow_html=True)
+        render_numeric_btc_intelligence(ov_b, btc_1d_calc)
     except Exception:
         pass
 
