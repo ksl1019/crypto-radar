@@ -212,14 +212,14 @@ def get_orderbook_heatmap(symbol="BTCUSDT"):
     bids["notional"] = bids["price"] * bids["qty"]
     asks["notional"] = asks["price"] * asks["qty"]
 
-    bids["bin"] = np.round(bids["price"] / 250) * 250
-    asks["bin"] = np.round(asks["price"] / 250) * 250
+    bids["bin"] = np.floor(bids["price"] / 100) * 100
+    asks["bin"] = np.ceil(asks["price"] / 100) * 100
     bid_grp = bids.groupby("bin")["notional"].sum().reset_index()
     bid_grp["side"] = "BID"
     ask_grp = asks.groupby("bin")["notional"].sum().reset_index()
     ask_grp["side"] = "ASK"
 
-    combined = pd.concat([ask_grp.tail(6), bid_grp.tail(6)]).sort_values("bin", ascending=False)
+    combined = pd.concat([ask_grp.head(6), bid_grp.tail(6)]).sort_values("bin", ascending=False)
     top_bid_price = float(bid_grp.loc[bid_grp["notional"].idxmax(), "bin"])
     top_bid_vol = float(bid_grp["notional"].max())
     top_ask_price = float(ask_grp.loc[ask_grp["notional"].idxmax(), "bin"])
@@ -693,7 +693,7 @@ with tab1:
     except Exception:
         st.warning("CVD 수급 차트를 불러오는 중입니다.")
 
-    st.markdown("#### 🔥 파이어차트 (실시간 호가창 유동성 매물벽 히트맵)")
+st.markdown("#### 🔥 파이어차트 (실시간 호가창 유동성 매물벽 히트맵)")
     try:
         heatmap_df, top_bid_p, top_bid_v, top_ask_p, top_ask_v = get_orderbook_heatmap("BTCUSDT")
         max_notional = heatmap_df["notional"].max() + 1e-9
@@ -703,19 +703,9 @@ with tab1:
             is_ask = r["side"] == "ASK"
             bar_col = "#FF4B4B" if is_ask else "#00D084"
             side_lbl = "매도벽" if is_ask else "매수벽"
-            rows_html += f"""
-            <div style="display:flex; align-items:center; margin-bottom:4px; font-size:0.78rem;">
-              <div style="width:78px; color:#C9D1D9; font-weight:bold;">${r['bin']:,.0f}</div>
-              <div style="flex:1; background:#0D1117; border-radius:4px; height:14px; overflow:hidden; margin:0 8px;">
-                <div style="width:{pct}%; background:{bar_col}; height:100%;"></div>
-              </div>
-              <div style="width:88px; text-align:right; color:{bar_col};">{side_lbl} ${r['notional']/1e6:.1f}M</div>
-            </div>"""
+            rows_html += f'<div style="display:flex;align-items:center;margin-bottom:5px;font-size:0.78rem;"><div style="width:76px;color:#C9D1D9;font-weight:bold;">${r["bin"]:,.0f}</div><div style="flex:1;background:#0D1117;border-radius:4px;height:14px;overflow:hidden;margin:0 8px;"><div style="width:{pct}%;background:{bar_col};height:100%;"></div></div><div style="width:88px;text-align:right;color:{bar_col};">{side_lbl} ${r["notional"]/1e6:.1f}M</div></div>'
 
-        st.markdown(f"""
-        <div class="metric-card" style="padding:12px;">
-            {rows_html}
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card" style="padding:12px;">{rows_html}</div>', unsafe_allow_html=True)
 
         ratio = top_bid_v / (top_ask_v + 1e-9)
         if ratio >= 1.25:
